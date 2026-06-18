@@ -7,8 +7,8 @@
   <a href="https://www.npmjs.com/package/pi-taskflow"><img src="https://img.shields.io/npm/dm/pi-taskflow?style=flat-square&color=6E8BFF&label=downloads" alt="npm downloads"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-43D9AD?style=flat-square" alt="MIT license"></a>
   <a href="#whats-inside"><img src="https://img.shields.io/badge/runtime%20deps-0-43D9AD?style=flat-square" alt="zero runtime dependencies"></a>
-  <a href="https://github.com/heggria/pi-taskflow/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/heggria/pi-taskflow/ci.yml?branch=main&style=flat-square&label=CI" alt="CI status"></a>
-  <a href="#whats-inside"><img src="https://img.shields.io/badge/tests-670-6E8BFF?style=flat-square" alt="670 tests"></a>
+  <a href="https://github.com/gscode1/pi-taskflow/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/gscode1/pi-taskflow/ci.yml?branch=main&style=flat-square&label=CI" alt="CI status"></a>
+  <a href="#whats-inside"><img src="https://img.shields.io/badge/tests-674-6E8BFF?style=flat-square" alt="674 tests"></a>
   <a href="#whats-inside"><img src="https://img.shields.io/badge/dogfooded-%E2%9C%93-43D9AD?style=flat-square" alt="dogfooded"></a>
   <a href="https://pi.dev"><img src="https://img.shields.io/badge/for-Pi%20coding%20agent-B692FF?style=flat-square" alt="for the Pi coding agent"></a>
 </p>
@@ -26,6 +26,22 @@ pi install npm:pi-taskflow
 ```
 
 </div>
+
+---
+
+> ## 🍴 This is a fork
+>
+> This repository is a fork of [`heggria/pi-taskflow`](https://github.com/heggria/pi-taskflow). All credit for the original design, the runtime, the DSL, the Shared Context Tree, the workspace isolation, and the 670-test test suite goes to the upstream maintainer and contributors.
+>
+> The three changes below are **fork-only additions** layered on top of the same codebase. They are not in upstream.
+
+| Fork change | What it does | Where to look |
+|---|---|---|
+| **`onBlock: "retry"` feedback propagation** | When a gate with `onBlock: "retry"` blocks, the rerun of the upstream phase now receives the gate's verdict and a "fix the issue above" instruction appended to its task. Without this, a re-executed upstream phase got the same prompt and could produce the same bad output (e.g. an empty `create-issues` output that still passes as "done"). | `extensions/runtime.ts` (`_retryFeedback` in `RuntimeDeps`); `test/gate-eval.test.ts` |
+| **Per-phase subagent timeouts (`timeoutMs`)** | A new `timeoutMs` field on each phase and on `RunOptions`. A subagent that exceeds the wall-clock cap (default 10 minutes; `0` disables) is killed and the phase is marked failed with a new `RunResult.timeout` flag. The transient-retry heuristic now treats timeouts (and idle timeouts) as deterministic stalls — they don't get auto-retried. | `extensions/runner.ts` (`runAgentProcess`, `DEFAULT_TIMEOUT_MS`); `extensions/schema.ts` (`timeoutMs` on `PhaseSchema`); `test/runner.test.ts` |
+| **Pluggable CLI providers (`provider: "pi" \| "agy"`)** | A new optional `provider` field on phases and agent configs, plus a `providerRoles` setting (mirror of `modelRoles`) so a single agent can be wired to different CLI runners per role. The `pi-agent-runner` package (file dep, `../pi-agent-runner`) abstracts the spawn layer; the new `agy` provider shows how to plug in an alternative runner. | `extensions/agents.ts` (`AgentConfig.provider`, `providerRoles`); `extensions/schema.ts` (`provider` on `PhaseSchema`); `extensions/runner.ts` (`runAgentProcess`, `AgentProvider`); `test/agents.test.ts` |
+
+**Upstream tracking:** watch [`heggria/pi-taskflow`](https://github.com/heggria/pi-taskflow) for upstream releases. To re-sync, merge `upstream/main` into this branch; the three changes above are isolated to small, well-marked surfaces and rebase cleanly.
 
 ---
 
@@ -739,12 +755,12 @@ Copy one into `.pi/taskflows/<name>.json` (or `~/.pi/agent/taskflows/`) and it r
 
 <div align="center">
 
-**0 runtime dependencies** · **670 tests** · **9 phase types** · **shared context tree** · **cross-session resume** · **cross-run memoization** · **detached execution** · **~9k LOC runtime**
+**1 runtime dependency (`pi-agent-runner`, local file)** · **674 tests** · **9 phase types** · **shared context tree** · **cross-session resume** · **cross-run memoization** · **detached execution** · **~9k LOC runtime**
 
 </div>
 
 - **Zero runtime dependencies.** No `dependencies` field — the runtime is built entirely on Node built-ins (`fs` / `path` / `os` / `child_process` / `crypto`). The file lock is `fs.openSync("wx")`, not a third-party library.
-- **670 tests across 33 test files** covering concurrency, atomic file locking (8-process race regressions), path-traversal hardening, cross-session resume, cross-run cache freshness (flow/thinking/tools key isolation, fingerprint invalidation, TTL/LRU eviction), gate verdicts, budget caps, retry/backoff, approval flows, loop termination, tournament judging, sub-flow composition, the shared context tree (blackboard reuse, supervision spawn, subflow validation/nesting), workspace isolation (temp/dedicated/worktree lifecycle, fail-open degrade, dynamic-flow rejection), dynamic sub-flow security hardening, detached execution (PID persistence, stale detection, crash→failed, resume after failure), live run-history refresh, callback isolation, the idle watchdog, model-role init config, parseModelFromLabel with parenthesized-model-name regression, and multi-fence `safeParse` recovery.
+- **674 tests across 33 test files** covering concurrency, atomic file locking (8-process race regressions), path-traversal hardening, cross-session resume, cross-run cache freshness (flow/thinking/tools key isolation, fingerprint invalidation, TTL/LRU eviction), gate verdicts, budget caps, retry/backoff, approval flows, loop termination, tournament judging, sub-flow composition, the shared context tree (blackboard reuse, supervision spawn, subflow validation/nesting), workspace isolation (temp/dedicated/worktree lifecycle, fail-open degrade, dynamic-flow rejection), dynamic sub-flow security hardening, detached execution (PID persistence, stale detection, crash→failed, resume after failure), live run-history refresh, callback isolation, the idle watchdog, model-role init config, parseModelFromLabel with parenthesized-model-name regression, and multi-fence `safeParse` recovery.
 - **Hardened by design.** Path-traversal defense (lexical + `realpath` containment check), runId validation, HTML/error sanitization, atomic writes, stale-lock stealing via `rename`, and an idle watchdog that kills wedged subagents (SIGTERM → SIGKILL after 5 minutes of silence). Dynamic sub-flows additionally get breadth caps, `cwd` containment, budget clamping, nesting depth caps, and prototype-pollution defense.
 - **Dogfooded.** Every new feature has to survive the project's own `self-improve` taskflow before it ships.
 
@@ -799,7 +815,7 @@ Runtime lives in `extensions/`, tests in `test/`, and runnable examples in `exam
 
 ## Contributing
 
-Contributions welcome — this is a young, fast-moving project. Open an issue or PR on [GitHub](https://github.com/heggria/pi-taskflow). Good first contributions: new example flows, phase-type ideas, and TUI polish. See [`CONTRIBUTING.md`](./CONTRIBUTING.md) and [`AGENTS.md`](./AGENTS.md) for coding conventions and common task recipes.
+Contributions welcome — this is a young, fast-moving project. Open an issue or PR on [GitHub](https://github.com/gscode1/pi-taskflow). Good first contributions: new example flows, phase-type ideas, and TUI polish. See [`CONTRIBUTING.md`](./CONTRIBUTING.md) and [`AGENTS.md`](./AGENTS.md) for coding conventions and common task recipes.
 
 ## License
 
