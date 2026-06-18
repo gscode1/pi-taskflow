@@ -147,6 +147,49 @@ test("onBlock:retry — gate blocks, upstream+gate re-execute once", async () =>
 	assert.ok(calls.filter((t) => t.includes("gate-task")).length >= 2, "gate ran at least twice");
 });
 
+test("onBlock:retry — upstream retry receives blocking gate feedback", async () => {
+	const prodCalls: string[] = [];
+	const def = {
+		name: "retry-feedback",
+		phases: [
+			{ id: "prod", type: "agent", task: "produce-report" },
+			{
+				id: "check",
+				type: "gate",
+				task: "gate-task",
+				dependsOn: ["prod"],
+				onBlock: "retry" as const,
+				retry: { max: 1 },
+			},
+		],
+	};
+	const state: RunState = mkState(def, "retry-feedback-m1");
+	let gateAttempt = 0;
+	const deps: RuntimeDeps = {
+		cwd: "/tmp",
+		agents: [dummyAgent],
+		runTask: async (_cwd, _agents, _an, task) => {
+			if (task.includes("produce-report")) {
+				prodCalls.push(task);
+				return mockRunResult("report");
+			}
+			if (task.includes("gate-task")) {
+				gateAttempt++;
+				return mockRunResult(gateAttempt === 1 ? "VERDICT: BLOCK missing issue URL" : "VERDICT: PASS");
+			}
+			return mockRunResult(task);
+		},
+	};
+
+	const result = await executeTaskflow(state, deps);
+
+	assert.equal(result.ok, true);
+	assert.equal(prodCalls.length, 2);
+	assert.equal(prodCalls[0], "produce-report");
+	assert.match(prodCalls[1], /Previous attempt was rejected by gate 'check'/);
+	assert.match(prodCalls[1], /VERDICT: BLOCK missing issue URL/);
+});
+
 test("onBlock:retry — max retries exhausted → halts", async () => {
 	const def = {
 		name: "retry-exhaust",

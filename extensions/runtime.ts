@@ -61,6 +61,8 @@ export interface RuntimeDeps {
 	_ctxDir?: string;
 	/** Internal: an isolated workspace dir override for the current phase (worktree isolation). */
 	_cwdOverride?: string;
+	/** Internal: feedback from a blocking downstream gate, appended when retrying upstream phases. */
+	_retryFeedback?: string;
 }
 
 export interface RuntimeResult {
@@ -519,7 +521,7 @@ async function runSpawnedChildren(
 					deps.agents,
 					agentName,
 					a.task ?? "",
-					{ model: phase.model, thinking: phase.thinking, tools: phase.tools, cwd: spawnCwd, signal: deps.signal, ctxDir, nodeId: childNodeId },
+					{ provider: phase.provider, model: phase.model, thinking: phase.thinking, timeoutMs: phase.timeoutMs, tools: phase.tools, cwd: spawnCwd, signal: deps.signal, ctxDir, nodeId: childNodeId },
 					deps.globalThinking,
 				);
 				out = r.output ?? "";
@@ -659,9 +661,11 @@ async function executePhaseInner(
 			agentName,
 			task,
 			{
+				provider: phase.provider,
 				model: phase.model,
 				thinking: phase.thinking,
 				tools: phase.tools,
+				timeoutMs: phase.timeoutMs,
 				cwd: effCwd,
 				signal: deps.signal,
 				onLive,
@@ -865,7 +869,7 @@ async function executePhaseInner(
 		const interp = interpolate(phase.task ?? "", ctx);
 		const text = interp.text;
 		const refWarning = warnUnresolvedRefs(phase.id, interp.missing);
-		const fullTask = preRead + text;
+		const fullTask = preRead + text + (deps._retryFeedback ?? "");
 		const agentName = resolveAgent(phase.agent, deps, state);
 		const inputHash = cacheKey(cc, [phase.id, agentName, phase.model ?? "", fullTask]);
 		const cached = cachedPhase(cc, inputHash);
@@ -915,7 +919,11 @@ async function executePhaseInner(
 					// NOTE: we intentionally pass the gate's `prior` (not the dep's own
 					// completed state) so the dep does NOT cache-hit and actually
 					// RE-RUNS — re-running upstream is the whole point of onBlock:retry.
-					const { _cwdOverride: _dropGateWs, ...depsForUpstream } = deps;
+					const { _cwdOverride: _dropGateWs, ...depsForUpstreamBase } = deps;
+					const depsForUpstream: RuntimeDeps = {
+						...depsForUpstreamBase,
+						_retryFeedback: `\n\nPrevious attempt was rejected by gate '${phase.id}'.\n\nGate feedback:\n${gatePs.output ?? "(no gate output)"}\n\nRetry the task and fix the issue above.`,
+					};
 					for (const depId of phase.dependsOn ?? []) {
 						const d = state.def.phases.find((p) => p.id === depId);
 						if (!d) continue;
