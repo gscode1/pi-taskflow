@@ -14,7 +14,7 @@ import { WORKSPACE_KEYWORDS } from "./workspace.ts";
 // Phase types
 // ---------------------------------------------------------------------------
 
-const PHASE_TYPES = ["agent", "parallel", "map", "gate", "reduce", "approval", "flow", "loop", "tournament"] as const;
+const PHASE_TYPES = ["agent", "parallel", "map", "gate", "reduce", "approval", "flow", "loop", "tournament", "exec"] as const;
 type PhaseType = (typeof PHASE_TYPES)[number];
 
 /** Loop iteration bounds. Authors may lower the max; the hard cap is a runaway guard. */
@@ -117,6 +117,7 @@ const PhaseSchema = Type.Object(
 		type: Type.Optional(StringEnum(PHASE_TYPES, { description: "Phase kind", default: "agent" })),
 		agent: Type.Optional(Type.String({ description: "Agent name to run this phase" })),
 		task: Type.Optional(Type.String({ description: "Task prompt (supports interpolation placeholders)" })),
+		cmd: Type.Optional(Type.String({ description: "[exec] Shell command run deterministically via `bash -c` (no LLM/subagent). Supports interpolation. stdout (trimmed) becomes the phase output; exit code maps to status (0=done, non-zero=failed). Honors output:'json', timeoutMs, and the run abort signal; usage is zero." })),
 
 		// map fan-out
 		over: Type.Optional(
@@ -496,6 +497,12 @@ export function validateTaskflow(def: unknown, opts: ValidationOptions = {}): Va
 		const root = opts.cwd ? path.resolve(opts.cwd) : undefined;
 		for (const p of flow.phases) {
 			if (!p || typeof p !== "object") continue;
+			// `exec` runs a host command without the subagent tool-permission layer.
+			// LLM-generated sub-flows are untrusted, so forbid it here (RCE guard) —
+			// only author-written flows may use exec (mirrors the workspace-keyword guard).
+			if ((p.type ?? "agent") === "exec") {
+				errors.push(`Dynamic sub-flow phase '${p.id}': 'exec' is not allowed in generated flows`);
+			}
 			// Per-phase concurrency override is also capped.
 			if (typeof p.concurrency === "number" && p.concurrency > MAX_DYNAMIC_CONCURRENCY) {
 				errors.push(`Dynamic sub-flow phase '${p.id}': concurrency too high (${p.concurrency}, max ${MAX_DYNAMIC_CONCURRENCY})`);
@@ -545,6 +552,7 @@ export function validateTaskflow(def: unknown, opts: ValidationOptions = {}): Va
 		if (type === "agent" || type === "gate") {
 			if (!p.task) errors.push(`Phase '${p.id}' (${type}) requires 'task'`);
 		}
+		if (type === "exec" && !p.cmd) errors.push(`Phase '${p.id}' (exec) requires 'cmd'`);
 		if (type === "map") {
 			if (!p.over) errors.push(`Phase '${p.id}' (map) requires 'over'`);
 			if (!p.task) errors.push(`Phase '${p.id}' (map) requires 'task'`);
@@ -795,6 +803,7 @@ function collectRefs(phase: Phase): { steps: string[]; args: string[] } {
 		while ((m = argRe.exec(s)) !== null) args.add(m[1]);
 	};
 	scan(phase.task);
+	scan(phase.cmd);
 	scan(phase.over);
 	scan(phase.when);
 	for (const b of phase.branches ?? []) scan(b.task);
