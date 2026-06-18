@@ -62,6 +62,7 @@ Keys of each object in `phases[]`. Some only apply to specific `type`s.
   "model": "claude-sonnet-4-5",   // per-phase model override
   "thinking": "high",       // per-phase thinking override
   "tools": ["read","bash"], // restrict tools for this phase's subagent
+  "timeoutMs": 600000,      // wall-clock cap for this phase (default 10m)
   "cwd": "packages/api",    // working directory for this phase's subagent
   "concurrency": 4,         // [map/parallel] fan-out cap for THIS phase
   "final": true             // mark this phase's output as the workflow result
@@ -83,6 +84,7 @@ Keys of each object in `phases[]`. Some only apply to specific `type`s.
 | `model` | all | agent/global | Per-phase model override. See §5. |
 | `thinking` | all | agent/global | Per-phase thinking level. See §5. |
 | `tools` | all | agent default | Whitelist of tools for the subagent. See §5. |
+| `timeoutMs` | agent-like | `600000` | Wall-clock timeout per subagent attempt; use for tool-heavy phases so chatter cannot hang forever. `0` disables. |
 | `cwd` | all | flow cwd | Run this phase's subagent in a different directory. |
 | `concurrency` | map, parallel | flow concurrency | Fan-out cap for this phase only. See §4. |
 | `context` | all | — | File paths / `{steps.X}` refs to **pre-read and inject** before the task. See §2.1. |

@@ -411,6 +411,39 @@ test("runAgentTask: idle watchdog kills a silent (stalled) subagent", async () =
 	}
 });
 
+test("runAgentTask: hard timeout kills a chatty subagent", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tf-hard-timeout-"));
+	const fakePi = path.join(dir, "fake-pi.mjs");
+	fs.writeFileSync(
+		fakePi,
+		`setInterval(() => console.log('{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"tick"}]}}'), 50);\n`,
+	);
+	const shim = path.join(dir, "shim.sh");
+	fs.writeFileSync(shim, `#!/bin/sh\nexec "${process.execPath}" "${fakePi}"\n`);
+	fs.chmodSync(shim, 0o755);
+
+	const agents: AgentConfig[] = [
+		{ name: "chatty", description: "d", systemPrompt: "", source: "user", filePath: "" },
+	];
+	const prevBin = process.env.PI_TASKFLOW_PI_BIN;
+	process.env.PI_TASKFLOW_PI_BIN = shim;
+	try {
+		const start = Date.now();
+		const res = await runAgentTask(dir, agents, "chatty", "do work", {
+			idleTimeoutMs: 1000,
+			timeoutMs: 250,
+		});
+		assert.ok(Date.now() - start < 10_000);
+		assert.equal(isFailed(res), true);
+		assert.equal(res.timeout, true);
+		assert.match(res.errorMessage ?? "", /wall-clock timeout/i);
+	} finally {
+		if (prevBin === undefined) delete process.env.PI_TASKFLOW_PI_BIN;
+		else process.env.PI_TASKFLOW_PI_BIN = prevBin;
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 // ── signal kill detection (C-1) ─────────────────────────────────────
 
 test("runAgentTask: process killed by signal marks as failed", async () => {

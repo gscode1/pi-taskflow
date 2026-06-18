@@ -69,6 +69,7 @@ export interface AgentConfig {
 	tools?: string[];
 	model?: string;
 	thinking?: string;
+	provider?: "pi" | "agy";
 	systemPrompt: string;
 	source: "user" | "project" | "built-in";
 	filePath: string;
@@ -171,8 +172,14 @@ export function discoverAgents(
 	cwd: string,
 	scope: AgentScope,
 	modelRoles?: Record<string, string>,
-	taskflowSettings: TaskflowSettings = DEFAULT_TASKFLOW_SETTINGS,
+	providerRolesOrSettings?: Record<string, string> | TaskflowSettings,
+	taskflowSettingsArg?: TaskflowSettings,
 ): AgentDiscoveryResult {
+	const providerRoles = providerRolesOrSettings && "builtInAgents" in providerRolesOrSettings ? undefined : providerRolesOrSettings;
+	const taskflowSettings: TaskflowSettings = providerRolesOrSettings && "builtInAgents" in providerRolesOrSettings
+		? providerRolesOrSettings as TaskflowSettings
+		: taskflowSettingsArg ?? DEFAULT_TASKFLOW_SETTINGS;
+
 	// Built-in agents ship with the package (extensions/agents/*.md).
 	// PI_TASKFLOW_BUILTIN_AGENTS_DIR is kept as a test hook only; user-facing
 	// enable/disable lives in settings.json under `taskflow.builtInAgents`.
@@ -203,9 +210,11 @@ export function discoverAgents(
 	if (modelRoles) {
 		for (const [name, agent] of agentMap.entries()) {
 			const resolved = resolveModelRole(agent.model, modelRoles);
-			if (resolved !== agent.model) {
+			const provider = resolveModelRole(agent.model, providerRoles);
+			if (resolved !== agent.model || provider !== undefined) {
 				const mutated: AgentConfig = { ...agent };
 				mutated.model = resolved;
+				if (provider === "pi" || provider === "agy") mutated.provider = provider;
 				agentMap.set(name, mutated);
 			}
 		}
@@ -217,6 +226,7 @@ export function discoverAgents(
 export interface SubagentSettings {
 	globalThinking?: string;
 	modelRoles?: Record<string, string>;
+	providerRoles?: Record<string, string>;
 	taskflow: TaskflowSettings;
 }
 
@@ -247,6 +257,7 @@ export function readSubagentSettings(): SubagentSettings {
 		return {
 			globalThinking: raw.subagents?.globalThinking ?? raw.defaultThinkingLevel,
 			modelRoles: raw.modelRoles,
+			providerRoles: raw.providerRoles,
 			taskflow: normalizeTaskflowSettings(raw.taskflow),
 		};
 	} catch {

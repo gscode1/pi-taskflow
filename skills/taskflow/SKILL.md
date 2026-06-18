@@ -113,6 +113,9 @@ Call the `taskflow` tool. To run a brand-new flow you write inline, pass
 | `when` | conditional guard — skip the phase unless the expression is truthy. Supports `{refs}`, `== != < > <= >=`, `&& \|\| !`, parentheses, quoted strings/numbers. Parse errors fail **open** (phase runs). |
 | `join` | dependency join: `"all"` (default — wait for every dep) or `"any"` (OR-join — run as soon as one dep completes). |
 | `retry` | `{ "max": N, "backoffMs": ms, "factor": k }` — retry a failing subagent up to N times; delay is `backoffMs * factor^attempt` (`factor:1`=fixed, `2`=exponential). |
+| `timeoutMs` | Wall-clock cap per subagent attempt; defaults to `600000` (10 minutes). Set explicitly on tool-heavy phases. |
+
+For external mutations (GitHub issues, deploys, package publishes), add a cheap deterministic preflight phase before the agent phase. If a hard preflight fails (auth, permission, feature disabled), instruct the agent to stop and report the exact error — do not loop trying alternate methods.
 
 ### Conditional routing (when + gate/branches)
 

@@ -349,6 +349,7 @@ Every phase needs a unique `id` and a `type` (defaults to `agent`). On top of th
 | `retry` | `{ max, backoffMs?, factor? }` — retry a failing subagent |
 | `output` | `"text"` (default) or `"json"` (exposes `{steps.ID.json}`) |
 | `model` / `thinking` / `tools` | Per-phase overrides for the subagent |
+| `timeoutMs` | Wall-clock cap per subagent attempt; defaults to 10 minutes (`600000`) |
 | `cwd` | Working directory for the subagent. A literal path, or a reserved keyword for **workspace isolation** — `"temp"` (ephemeral dir, removed after), `"dedicated"` (persistent dir under the run state, kept), `"worktree"` (a git worktree on a throwaway branch, removed after). Fail-open; rejected in LLM-authored sub-flows. |
 | `context` | File paths to pre-read and inject into the agent prompt |
 | `contextLimit` | Max chars per context file (default 8000) |
@@ -394,7 +395,7 @@ with the run — flows that don't opt in behave exactly as before.
 
 - **`when`** — skip a phase unless an expression is truthy. Supports `{refs}`, `== != < > <= >=`, `&& || !`, parentheses, and quoted strings/numbers. Pair with `join: "any"` on the merge phase for real if/else routing. Parse errors **fail open** (the phase runs — never silently dropped).
 - **`join: "any"`** — an OR-join: the phase runs as soon as *one* dependency completes (default `"all"` waits for all).
-- **`retry`** — `{ "max": 2, "backoffMs": 500, "factor": 2 }` retries a failing subagent with fixed or exponential backoff; usage is summed and the attempt count shows as `↻N` in the TUI. Transient provider errors (rate-limit / 5xx / timeout) **auto-retry even without an explicit policy**; hard errors don't.
+- **`retry`** — `{ "max": 2, "backoffMs": 500, "factor": 2 }` retries a failing subagent with fixed or exponential backoff; usage is summed and the attempt count shows as `↻N` in the TUI. Transient provider errors (rate-limit / 5xx) **auto-retry even without an explicit policy**; hard errors and phase timeouts don't.
 - **`onBlock`** — `"halt"` (default) stops the run when a gate blocks. `"retry"` retries upstream phases when a gate blocks, instead of halting — a self-healing rework loop with budget and idle-watchdog guards and a nested recursion depth cap.
 - **`eval`** — zero-token machine-checkable criteria that run *before* the LLM gate. If the eval check fails, the gate blocks without spawning an agent.
 - **`approval`** — pause for a human (Approve / Reject / Edit). Reject halts the flow; Edit injects the typed note as the phase output for downstream steps. Non-interactive runs (detached / CI) **auto-reject** (safety: approval gates are never bypassed).
@@ -667,6 +668,17 @@ Your choices are written to `~/.pi/agent/settings.json`:
     "arbiter":  "openrouter/qwen/qwen3.7-max",
     "vision":   "minimax/MiniMax-M3",
     "reasoner": "z-ai/glm-5.1"
+  }
+}
+```
+
+If you use a non-Pi runner, add matching provider roles manually:
+
+```json
+{
+  "providerRoles": {
+    "fast": "agy",
+    "strong": "agy"
   }
 }
 ```

@@ -627,6 +627,19 @@ test("modelRoles: resolves {{role}} references from settings", () => {
 	assert.equal(byName["nomodel-agent"], undefined);
 });
 
+test("providerRoles: resolves {{role}} references from settings", () => {
+	const agentsDir = path.join(userAgentDir, "agents");
+	writeAgent(agentsDir, "fast.md", { name: "fast-agent", description: "fast", model: "{{fast}}" });
+	writeAgent(agentsDir, "literal.md", { name: "literal-agent", description: "literal", model: "openai/gpt-4o" });
+
+	const { agents } = discoverAgents(projectCwd, "user", { fast: "Gemini 3.5 Flash (Low)" }, { fast: "agy" });
+	const byName = Object.fromEntries(agents.map(a => [a.name, a]));
+
+	assert.equal(byName["fast-agent"].model, "Gemini 3.5 Flash (Low)");
+	assert.equal(byName["fast-agent"].provider, "agy");
+	assert.equal(byName["literal-agent"].provider, undefined);
+});
+
 test("modelRoles: unmapped role resolves to undefined", () => {
 	const agentsDir = path.join(userAgentDir, "agents");
 	writeAgent(agentsDir, "unknown.md", { name: "unk", description: "unknown", model: "{{nonexistent}}" });
@@ -641,6 +654,16 @@ test("modelRoles: no roles configured leaves {{role}} as-is", () => {
 
 	const { agents } = discoverAgents(projectCwd, "user");
 	assert.equal(agents[0].model, "{{fast}}");
+});
+
+test("readSubagentSettings: reads providerRoles from settings.json", () => {
+	const settingsPath = path.join(userAgentDir, "settings.json");
+	fs.writeFileSync(settingsPath, JSON.stringify({
+		providerRoles: { fast: "agy", strong: "pi" },
+	}), "utf-8");
+
+	const settings = readSubagentSettings();
+	assert.deepEqual(settings.providerRoles, { fast: "agy", strong: "pi" });
 });
 
 test("readSubagentSettings: reads modelRoles from settings.json", () => {

@@ -4,23 +4,14 @@
  * subagent extension's runSingleAgent.
  */
 
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { runAgentProcess, type AgentProvider } from "pi-agent-runner";
 import type { AgentConfig } from "./agents.ts";
 import { emptyUsage, type UsageStats } from "./usage.ts";
-
-const activeChildren = new Set<number>();
-const killAll = () => {
-	for (const pid of activeChildren) {
-		try { process.kill(pid, "SIGKILL"); } catch { /* already dead */ }
-	}
-};
-process.on("exit", killAll);
-process.on("SIGTERM", () => { killAll(); process.exit(143); });
 
 export interface RunResult {
 	agent: string;
@@ -36,6 +27,8 @@ export interface RunResult {
 	attempts?: number;
 	/** Set when the subagent was killed by the idle watchdog (not a user abort). */
 	idleTimeout?: boolean;
+	/** Set when the subagent exceeded the wall-clock timeout. */
+	timeout?: boolean;
 }
 
 export interface LiveUpdate {
@@ -46,6 +39,7 @@ export interface LiveUpdate {
 }
 
 export interface RunOptions {
+	provider?: AgentProvider;
 	model?: string;
 	thinking?: string;
 	tools?: string[];
@@ -60,6 +54,8 @@ export interface RunOptions {
 	 * the prior behaviour (no idle timeout). Defaults to DEFAULT_IDLE_TIMEOUT_MS.
 	 */
 	idleTimeoutMs?: number;
+	/** Wall-clock cap for this subagent attempt. Defaults to 10 minutes. 0 disables. */
+	timeoutMs?: number;
 	/**
 	 * Shared Context Tree (opt-in). When set, the spawned subagent receives
 	 * PI_TASKFLOW_CTX_DIR + PI_TASKFLOW_NODE_ID in its environment and is loaded
@@ -78,6 +74,7 @@ export interface RunOptions {
  * bounding a true hang.
  */
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60_000;
+const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 
 /** The Shared Context Tree tool names a subagent may call when sharing is on. */
 export const CTX_TOOL_NAMES = ["ctx_read", "ctx_write", "ctx_report", "ctx_spawn"] as const;
@@ -128,8 +125,8 @@ const TRANSIENT_ERROR_RE =
 	/rate[_\s-]?limit|too\s+many\s+requests|overloaded|\b429\b|\b503\b|\b502\b|\b504\b|service\s+unavailable|temporarily\s+unavailable|timeout|timed?\s+out|econnreset|etimedout|socket\s+hang\s*up/i;
 export function isTransientError(r: RunResult): boolean {
 	if (r.stopReason === "aborted") return false;
-	// Idle timeout is a deterministic stall — retrying won't help.
-	if (r.stopReason === "error" && r.idleTimeout) return false;
+	// Timeouts are deterministic stalls — retrying usually just burns tokens.
+	if (r.stopReason === "error" && (r.idleTimeout || r.timeout)) return false;
 	const hay = `${r.errorMessage ?? ""} ${r.stderr ?? ""} ${r.output ?? ""}`;
 	return TRANSIENT_ERROR_RE.test(hay);
 }
@@ -305,25 +302,6 @@ async function writePromptToTempFile(filePath: string, prompt: string): Promise<
 	});
 }
 
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	// Explicit override (used by tests and unusual launch setups).
-	const override = process.env.PI_TASKFLOW_PI_BIN;
-	if (override) return { command: override, args };
-
-	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-	// Only re-exec the current script if it actually looks like the pi CLI entry.
-	const looksLikePi = currentScript ? /(?:^|[\\/])(?:cli|pi)\.(?:js|mjs|cjs)$/.test(currentScript) : false;
-	if (currentScript && !isBunVirtualScript && looksLikePi && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
-
-	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) return { command: process.execPath, args };
-	return { command: "pi", args };
-}
-
 /**
  * Resolve the path to this extension's entry file, so a spawned subagent can be
  * launched with `--extension <path>` and register the ctx_* tools. Returns
@@ -370,6 +348,7 @@ export async function runAgentTask(
 		};
 	}
 
+	const provider = opts.provider ?? agent.provider;
 	const model = opts.model ?? agent.model;
 	const thinking = opts.thinking ?? agent.thinking ?? globalThinking;
 	const ctxEnabledEarly = Boolean(opts.ctxDir && opts.nodeId);
@@ -436,111 +415,59 @@ export async function runAgentTask(
 			ctxEnv.PI_TASKFLOW_NODE_ID = opts.nodeId;
 		}
 
-		let wasAborted = false;
-		let idleTimedOut = false;
-		let killedBySignal: string | undefined;
-		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: opts.cwd ?? defaultCwd,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env, ...ctxEnv },
-			});
-			if (proc.pid) activeChildren.add(proc.pid);
-			let buffer = "";
-
-			// Idle watchdog: a subagent that goes silent on stdout for too long is
-			// treated as wedged and killed, so one stalled child cannot hang the
-			// whole taskflow forever. The timer is reset on every stdout chunk and
-			// torn down on close/error.
-			const idleMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
-			let idleTimer: ReturnType<typeof setTimeout> | undefined;
-			let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
-			const clearTimers = () => {
-				if (idleTimer) clearTimeout(idleTimer);
-				if (forceKillTimer) clearTimeout(forceKillTimer);
-			};
-			const hardKill = () => {
-				proc.kill("SIGTERM");
-				forceKillTimer = setTimeout(() => proc.kill("SIGKILL"), 5000);
-				forceKillTimer.unref();
-			};
-			const armIdle = () => {
-				if (idleTimer) clearTimeout(idleTimer);
-				if (idleMs <= 0) return; // disabled
-				idleTimer = setTimeout(() => {
-					idleTimedOut = true;
-					hardKill();
-				}, idleMs);
-				idleTimer.unref();
-			};
-			armIdle();
-
-			const processLine = (line: string) => {
-				const live = foldEventLine(acc, line);
-				if (live && opts.onLive) opts.onLive(live);
-			};
-
-			proc.stdout.on("data", (data) => {
-				armIdle(); // progress observed — reset the idle watchdog
-				buffer += data.toString();
+		const effectiveProvider = provider ?? "pi";
+		let buffer = "";
+		const processLine = (line: string) => {
+			const live = foldEventLine(acc, line);
+			if (live && opts.onLive) opts.onLive(live);
+		};
+		const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+		const timeoutController = new AbortController();
+		let hardTimedOut = false;
+		const relayAbort = () => timeoutController.abort();
+		opts.signal?.addEventListener("abort", relayAbort, { once: true });
+		const timeoutTimer = timeoutMs > 0
+			? setTimeout(() => { hardTimedOut = true; timeoutController.abort(); }, timeoutMs)
+			: undefined;
+		if (timeoutTimer) timeoutTimer.unref();
+		const run = await runAgentProcess({
+			provider: effectiveProvider,
+			cwd: opts.cwd ?? defaultCwd,
+			prompt: `Task: ${task}`,
+			piBin: process.env.PI_TASKFLOW_PI_BIN,
+			piArgs: effectiveProvider === "pi" ? args : undefined,
+			systemPromptFile: effectiveProvider === "agy" ? tmpPromptPath ?? undefined : undefined,
+			model,
+			idleTimeoutMs: opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
+			signal: timeoutController.signal,
+			env: { ...process.env, ...ctxEnv },
+			onStdout: (chunk) => {
+				if (effectiveProvider === "agy") return;
+				buffer += chunk;
 				const lines = buffer.split("\n");
 				buffer = lines.pop() || "";
 				for (const line of lines) processLine(line);
-			});
-			// Cap prevents OOM from verbose tool output (e.g., npm install). 64 KB is
-			// generous for error diagnosis while preventing memory exhaustion.
-			const STDERR_MAX_LEN = 64 * 1024;
-			let stderrCapped = false;
-			proc.stderr.on("data", (data) => {
-				if (!stderrCapped) {
-					result.stderr += data.toString();
-					if (result.stderr.length >= STDERR_MAX_LEN) {
-						result.stderr = result.stderr.slice(0, STDERR_MAX_LEN) + "\n[...stderr truncated at 64KB]";
-						stderrCapped = true;
-					}
-				}
-			});
-			proc.on("close", (code, signal) => {
-				if (proc.pid) activeChildren.delete(proc.pid);
-				clearTimers();
-				if (buffer.trim()) processLine(buffer);
-				if (code === null && signal) killedBySignal = signal;
-				resolve(code ?? 0);
-			});
-			proc.on("error", (err) => {
-				clearTimers();
-				if (!result.stderr) result.stderr = err.message;
-				if (!result.errorMessage) result.errorMessage = err.message;
-				resolve(1);
-			});
-
-			if (opts.signal) {
-				const kill = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					// Force-kill fallback. proc.kill("SIGKILL") is idempotent if
-					// the process already exited, and `proc.killed` is set true
-					// synchronously by the SIGTERM above — so the previous
-					// `if (!proc.killed)` guard would skip SIGKILL entirely,
-					// hanging forever on a child that ignores SIGTERM.
-					// .unref() keeps the timer from holding the event loop open
-					// after the process is gone.
-					const forceKill = setTimeout(() => proc.kill("SIGKILL"), 5000);
-					forceKill.unref();
-				};
-				if (opts.signal.aborted) kill();
-				else opts.signal.addEventListener("abort", kill, { once: true });
-			}
+			},
 		});
+		if (timeoutTimer) clearTimeout(timeoutTimer);
+		opts.signal?.removeEventListener("abort", relayAbort);
+		if (buffer.trim()) processLine(buffer);
+		const exitCode = run.exitCode;
+		const wasAborted = Boolean(opts.signal?.aborted);
+		const idleTimedOut = Boolean(run.idleTimeout);
+		const killedBySignal = run.killedBySignal;
+		result.stderr = run.stderr.length >= 64 * 1024 ? `${run.stderr.slice(0, 64 * 1024)}\n[...stderr truncated at 64KB]` : run.stderr;
+		if (effectiveProvider === "agy") {
+			result.output = run.stdout.trim();
+			if (result.output) acc.lastActivity = result.output.replace(/\s+/g, " ").slice(0, 200);
+		}
 
 		result.exitCode = exitCode;
 		result.usage = acc.usage;
 		result.model = acc.model;
 		result.stopReason = acc.stopReason;
 		result.errorMessage = acc.errorMessage;
-		result.output = getFinalOutput(acc.messages);
+		if (effectiveProvider !== "agy") result.output = getFinalOutput(acc.messages);
 		// M-6: surface truncation when the message cap was hit so downstream
 		// phases and the user know output was cut short.
 		if (acc.truncated) {
@@ -554,7 +481,12 @@ export async function runAgentTask(
 			result.stopReason = "error";
 			result.errorMessage = `Subagent killed by signal ${killedBySignal}`;
 		}
-		if (idleTimedOut) {
+		if (hardTimedOut) {
+			result.exitCode = result.exitCode || 1;
+			result.stopReason = "error";
+			result.timeout = true;
+			result.errorMessage = `Subagent exceeded wall-clock timeout of ${Math.round(timeoutMs / 1000)}s — killed`;
+		} else if (idleTimedOut) {
 			// Distinct, actionable signal: the child was killed for being idle, not
 			// a user abort. stopReason "error" keeps it in the failed bucket so the
 			// runtime's retry/fail handling treats it as a real failure.

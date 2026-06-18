@@ -49,7 +49,7 @@ try {
 	cleanupConfig.maxKeep = settings.taskflow.maxKeptRuns;
 	cleanupConfig.maxAgeDays = settings.taskflow.maxRunAgeDays;
 	const scope: AgentScope = state.def.agentScope ?? "user";
-	const { agents } = discoverAgents(ctx.cwd, scope, settings.modelRoles, settings.taskflow);
+	const { agents } = discoverAgents(ctx.cwd, scope, settings.modelRoles, settings.providerRoles, settings.taskflow);
 
 	const result = await executeTaskflow(state, {
 		cwd: ctx.cwd,
