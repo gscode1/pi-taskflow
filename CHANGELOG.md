@@ -2,6 +2,26 @@
 
 All notable changes to pi-taskflow are documented here. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
+## [Unreleased]
+
+### Added (fork-only)
+- **OpenTelemetry traces for flows (opt-in, zero-dependency seam).** The runtime
+  now emits a `taskflow.run` → `taskflow.phase` → `taskflow.subagent` span
+  hierarchy through a vendor-neutral `Tracer` interface
+  (`extensions/trace.ts`). The default is a no-op tracer, so the zero-runtime-
+  dependency promise is preserved and nothing changes unless you opt in. Pass a
+  tracer via `RuntimeDeps.tracer`. Spans carry GenAI-convention attributes
+  (`gen_ai.usage.input_tokens`/`output_tokens`, model, cost, attempts,
+  `cache.hit`, status). Fan-out items, loop iterations, tournament candidates,
+  and retry attempts each get their own subagent span; sub-flows nest under
+  their parent phase span.
+  - An **optional** OpenTelemetry adapter lives at `extensions/otel/adapter.ts`
+    and is the only code that imports `@opentelemetry/api` — install it yourself
+    and call `otelTracer()` to wire spans into Jaeger/Tempo/Honeycomb/etc.
+  - Where to look: `extensions/trace.ts`, `extensions/otel/adapter.ts`,
+    `extensions/runtime.ts` (`executeTaskflow`, per-phase span, `baseRun`),
+    `test/trace.test.ts`.
+
 ## [0.0.23] — 2026-06-11
 
 > Feature release: the **Shared Context Tree** — an opt-in mechanism that gives

@@ -23,6 +23,19 @@ import { hashInput, newRunId, type PhaseState, type RunState, runsDir } from "./
 import { CacheStore, resolveFingerprint } from "./cache.ts";
 import { ctxDirFor, drainPendingSpawns, initCtxDir, registerNode, setNodeStatus, type SpawnAssignment } from "./context-store.ts";
 import { allocateWorkspace, isWorkspaceKeyword, type Workspace } from "./workspace.ts";
+import { NOOP_TRACER, SPAN, type SpanLike, type Tracer } from "./trace.ts";
+
+/** Attach GenAI-convention usage attributes to a span (best-effort). */
+function setUsageAttributes(span: SpanLike, u: UsageStats | undefined): void {
+	if (!u) return;
+	span.setAttributes({
+		"gen_ai.usage.input_tokens": u.input,
+		"gen_ai.usage.output_tokens": u.output,
+		"taskflow.usage.cache_read_tokens": u.cacheRead,
+		"taskflow.usage.cost_usd": u.cost,
+		"taskflow.usage.turns": u.turns,
+	});
+}
 
 /** A human-in-the-loop approval request raised by an `approval` phase. */
 export interface ApprovalRequest {
@@ -64,6 +77,13 @@ export interface RuntimeDeps {
 	_cwdOverride?: string;
 	/** Internal: feedback from a blocking downstream gate, appended when retrying upstream phases. */
 	_retryFeedback?: string;
+	/**
+	 * Optional vendor-neutral tracer. Defaults to a no-op. Pass an OpenTelemetry
+	 * adapter (see `extensions/otel/adapter.ts`) to emit run/phase/subagent spans.
+	 */
+	tracer?: Tracer;
+	/** Internal: the parent span for spans started below this level (run → phase → subagent). */
+	_parentSpan?: SpanLike;
 }
 
 export interface RuntimeResult {
@@ -655,26 +675,52 @@ async function executePhaseInner(
 		preRead,
 	};
 
-	const baseRun = (agentName: string, task: string, onLive?: (l: LiveUpdate) => void, ctxNodeId?: string) =>
-		run(
-			effCwd,
-			deps.agents,
-			agentName,
-			task,
-			{
-				provider: phase.provider,
-				model: phase.model,
-				thinking: phase.thinking,
-				tools: phase.tools,
-				timeoutMs: phase.timeoutMs,
-				cwd: effCwd,
-				signal: deps.signal,
-				onLive,
-				ctxDir: ctxDir,
-				nodeId: ctxDir ? ctxNodeId : undefined,
+	const tracer = deps.tracer ?? NOOP_TRACER;
+	// One span per subagent spawn (each fan-out item, loop iteration, tournament
+	// candidate, and retry attempt is a distinct call to baseRun → distinct span),
+	// parented to the phase span threaded in via `_parentSpan`.
+	const baseRun = async (agentName: string, task: string, onLive?: (l: LiveUpdate) => void, ctxNodeId?: string): Promise<RunResult> => {
+		const span = tracer.startSpan(SPAN.subagent, {
+			parent: deps._parentSpan,
+			attributes: {
+				"agent.name": agentName,
+				"agent.provider": phase.provider ?? "pi",
+				"phase.id": phase.id,
+				"gen_ai.request.model": phase.model,
 			},
-			deps.globalThinking,
-		);
+		});
+		try {
+			const r = await run(
+				effCwd,
+				deps.agents,
+				agentName,
+				task,
+				{
+					provider: phase.provider,
+					model: phase.model,
+					thinking: phase.thinking,
+					tools: phase.tools,
+					timeoutMs: phase.timeoutMs,
+					cwd: effCwd,
+					signal: deps.signal,
+					onLive,
+					ctxDir: ctxDir,
+					nodeId: ctxDir ? ctxNodeId : undefined,
+				},
+				deps.globalThinking,
+			);
+			span.setAttributes({ "gen_ai.response.model": r.model });
+			setUsageAttributes(span, r.usage);
+			const failed = isFailed(r);
+			span.setStatus({ ok: !failed, message: failed ? r.errorMessage || r.stderr : undefined });
+			span.end();
+			return r;
+		} catch (e) {
+			span.setStatus({ ok: false, message: e instanceof Error ? e.message : String(e) });
+			span.end();
+			throw e;
+		}
+	};
 
 	// Wrap each subagent call in the phase's retry policy. Usage is summed across
 	// attempts; the attempt count rides along on the result for the TUI.
@@ -1763,8 +1809,31 @@ function safeProgress(deps: RuntimeDeps, state: RunState): void {
  */
 export async function executeTaskflow(state: RunState, deps: RuntimeDeps): Promise<RuntimeResult> {
 	const def: Taskflow = state.def;
+	// Root span for the whole run. Sub-flows pass their parent phase span via
+	// `_parentSpan`, so nested flows nest in the trace instead of orphaning.
+	const tracer = deps.tracer ?? NOOP_TRACER;
+	const runSpan = tracer.startSpan(SPAN.run, {
+		startTime: state.createdAt,
+		parent: deps._parentSpan,
+		attributes: {
+			"taskflow.name": state.flowName,
+			"taskflow.run_id": state.runId,
+			"taskflow.phase_count": def.phases.length,
+			"taskflow.detached": state.detached ?? false,
+		},
+	});
+	// Child spans below the root parent to the run span.
+	const tracedDeps: RuntimeDeps = { ...deps, _parentSpan: runSpan };
 	try {
-		return await runTaskflowLayers(state, deps);
+		const result = await runTaskflowLayers(state, tracedDeps);
+		runSpan.setAttributes({
+			"taskflow.status": result.state.status,
+			"taskflow.total_cost_usd": result.totalUsage.cost,
+		});
+		setUsageAttributes(runSpan, result.totalUsage);
+		runSpan.setStatus({ ok: result.ok });
+		runSpan.end();
+		return result;
 	} catch (e) {
 		// A thrown phase must not leave the run wedged in "running" (which breaks
 		// resume). Mark any in-flight phase + the run as failed, persist, and return.
@@ -1779,6 +1848,9 @@ export async function executeTaskflow(state: RunState, deps: RuntimeDeps): Promi
 		state.status = "failed";
 		safeEmit(deps, state);
 		const totalUsage = aggregateUsage(Object.values(state.phases).map((p) => p.usage ?? emptyUsage()));
+		runSpan.setStatus({ ok: false, message });
+		runSpan.setAttributes({ "taskflow.status": "failed" });
+		runSpan.end();
 		return { state, finalOutput: `Taskflow '${def.name}' crashed: ${message}`, ok: false, totalUsage };
 	}
 }
@@ -1865,7 +1937,30 @@ async function runTaskflowLayers(state: RunState, deps: RuntimeDeps): Promise<Ru
 			};
 			safeProgress(deps, state);
 
-			const ps = await executePhase(phase, state, deps, prior, () => safeProgress(deps, state));
+			// Per-phase span, parented to the run span. Subagent spawns below parent
+			// to THIS span (threaded via `_parentSpan`).
+			const tracer = deps.tracer ?? NOOP_TRACER;
+			const phaseSpan = tracer.startSpan(SPAN.phase, {
+				startTime: startedAt,
+				parent: deps._parentSpan,
+				attributes: {
+					"phase.id": phase.id,
+					"phase.type": phase.type ?? "agent",
+				},
+			});
+			const ps = await executePhase(phase, state, { ...deps, _parentSpan: phaseSpan }, prior, () =>
+				safeProgress(deps, state),
+			);
+			phaseSpan.setAttributes({
+				"phase.status": ps.status,
+				"phase.attempts": ps.attempts,
+				"phase.model": ps.model,
+				"cache.hit": ps.cacheHit ?? false,
+			});
+			setUsageAttributes(phaseSpan, ps.usage);
+			if (ps.status === "failed") phaseSpan.setStatus({ ok: false, message: ps.error });
+			else phaseSpan.setStatus({ ok: true });
+			phaseSpan.end(ps.endedAt);
 			// Preserve the phase start time: executePhase returns a fresh PhaseState
 			// that omits startedAt (cached/resumed results carry their own).
 			state.phases[phase.id] = ps.startedAt ? ps : { ...ps, startedAt };
