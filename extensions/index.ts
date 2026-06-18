@@ -29,6 +29,7 @@ import { renderRunResult, summarizeRun } from "./render.ts";
 import { RunHistoryComponent, type RunHistoryResult } from "./runs-view.ts";
 import { ApprovalViewComponent, type ApprovalChoice } from "./approval-view.ts";
 import { executeTaskflow, type ApprovalDecision, type ApprovalRequest, type RuntimeResult } from "./runtime.ts";
+import { startTracing, type TracingSession } from "./otel/setup.ts";
 import { finalPhase, resolveArgs, type Taskflow, validateTaskflow, desugar, isShorthand } from "./schema.ts";
 import {
 	getFlow,
@@ -192,6 +193,7 @@ async function runFlow(
 	// (no event bursts) while keeping the spinner, elapsed timers, live tokens
 	// and the latest message current. Phase events only mutate `state`.
 	let heartbeat: ReturnType<typeof setInterval> | undefined;
+	let tracing: TracingSession | undefined;
 	if (onUpdate) {
 		heartbeat = setInterval(() => {
 			if (state.status === "running") emit(state);
@@ -284,6 +286,10 @@ async function runFlow(
 			}
 		}
 
+		// Opt-in OpenTelemetry: only constructs an SDK when OTEL_EXPORTER_OTLP_ENDPOINT
+		// is set (else undefined → untraced, zero overhead). Flushed in `finally`.
+		tracing = startTracing();
+
 		const result = await executeTaskflow(state, {
 			cwd: ctx.cwd,
 			agents,
@@ -292,12 +298,14 @@ async function runFlow(
 			persist: persistThrottled,
 			requestApproval,
 			loadFlow: (name: string) => getFlow(ctx.cwd, name)?.def,
+			tracer: tracing?.tracer,
 		});
 		return result;
 	} finally {
 		if (heartbeat) clearInterval(heartbeat);
 		saveRun(state, cleanupConfig); // force-persist terminal state
 		emit(state); // final render reflecting terminal state
+		await tracing?.shutdown(); // flush spans before returning
 	}
 }
 

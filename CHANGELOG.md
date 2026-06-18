@@ -15,12 +15,21 @@ All notable changes to pi-taskflow are documented here. This project follows [Ke
   `cache.hit`, status). Fan-out items, loop iterations, tournament candidates,
   and retry attempts each get their own subagent span; sub-flows nest under
   their parent phase span.
-  - An **optional** OpenTelemetry adapter lives at `extensions/otel/adapter.ts`
-    and is the only code that imports `@opentelemetry/api` — install it yourself
-    and call `otelTracer()` to wire spans into Jaeger/Tempo/Honeycomb/etc.
+  - **Activation for live `/tf` runs:** set the standard
+    `OTEL_EXPORTER_OTLP_ENDPOINT` env var. The extension then lazily boots an
+    OTLP exporter and wires spans through automatically — for both foreground
+    and detached (background) runs, flushing before the process exits. Unset =
+    zero overhead, untraced. Requires installing `@opentelemetry/sdk-trace-node`
+    + `@opentelemetry/exporter-trace-otlp-http` (fail-open: if they're missing
+    the run proceeds untraced with a one-line warning).
+  - The OpenTelemetry packages are **never** dependencies of this repo. The
+    adapter (`extensions/otel/adapter.ts`) and SDK bootstrap
+    (`extensions/otel/setup.ts`) are the only code that touches them, via lazy
+    `require`. Programmatic embedders can still inject any `RuntimeDeps.tracer`.
   - Where to look: `extensions/trace.ts`, `extensions/otel/adapter.ts`,
-    `extensions/runtime.ts` (`executeTaskflow`, per-phase span, `baseRun`),
-    `test/trace.test.ts`.
+    `extensions/otel/setup.ts`, `extensions/runtime.ts` (`executeTaskflow`,
+    per-phase span, `baseRun`), `extensions/index.ts` + `extensions/detached-runner.ts`
+    (activation), `test/trace.test.ts`, `test/otel-setup.test.ts`.
 
 ## [0.0.23] — 2026-06-11
 
