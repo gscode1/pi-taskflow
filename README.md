@@ -33,15 +33,16 @@ pi install npm:pi-taskflow
 >
 > This repository is a fork of [`heggria/pi-taskflow`](https://github.com/heggria/pi-taskflow). All credit for the original design, the runtime, the DSL, the Shared Context Tree, the workspace isolation, and the 670-test test suite goes to the upstream maintainer and contributors.
 >
-> The three changes below are **fork-only additions** layered on top of the same codebase. They are not in upstream.
+> The changes below are **fork-only additions** layered on top of the same codebase. They are not in upstream.
 
 | Fork change | What it does | Where to look |
 |---|---|---|
 | **`onBlock: "retry"` feedback propagation** | When a gate with `onBlock: "retry"` blocks, the rerun of the upstream phase now receives the gate's verdict and a "fix the issue above" instruction appended to its task. Without this, a re-executed upstream phase got the same prompt and could produce the same bad output (e.g. an empty `create-issues` output that still passes as "done"). | `extensions/runtime.ts` (`_retryFeedback` in `RuntimeDeps`); `test/gate-eval.test.ts` |
 | **Per-phase subagent timeouts (`timeoutMs`)** | A new `timeoutMs` field on each phase and on `RunOptions`. A subagent that exceeds the wall-clock cap (default 10 minutes; `0` disables) is killed and the phase is marked failed with a new `RunResult.timeout` flag. The transient-retry heuristic now treats timeouts (and idle timeouts) as deterministic stalls — they don't get auto-retried. | `extensions/runner.ts` (`runAgentProcess`, `DEFAULT_TIMEOUT_MS`); `extensions/schema.ts` (`timeoutMs` on `PhaseSchema`); `test/runner.test.ts` |
 | **Pluggable CLI providers (`provider: "pi" \| "agy"`)** | A new optional `provider` field on phases and agent configs, plus a `providerRoles` setting (mirror of `modelRoles`) so a single agent can be wired to different CLI runners per role. The `pi-agent-runner` package (file dep, `../pi-agent-runner`) abstracts the spawn layer; the new `agy` provider shows how to plug in an alternative runner. | `extensions/agents.ts` (`AgentConfig.provider`, `providerRoles`); `extensions/schema.ts` (`provider` on `PhaseSchema`); `extensions/runner.ts` (`runAgentProcess`, `AgentProvider`); `test/agents.test.ts` |
+| **OpenTelemetry traces for flows** | An opt-in, **zero-dependency** tracing seam. The runtime emits a `taskflow.run` → `taskflow.phase` → `taskflow.subagent` span hierarchy (GenAI-convention attributes: tokens, model, cost, attempts, `cache.hit`, status) through a vendor-neutral `Tracer` that defaults to a no-op — nothing changes unless you opt in via `RuntimeDeps.tracer`. An optional adapter wraps real OpenTelemetry; it is the only code that imports `@opentelemetry/api`. | `extensions/trace.ts`; `extensions/otel/adapter.ts`; `extensions/runtime.ts` (`executeTaskflow`, per-phase span, `baseRun`); `test/trace.test.ts` |
 
-**Upstream tracking:** watch [`heggria/pi-taskflow`](https://github.com/heggria/pi-taskflow) for upstream releases. To re-sync, merge `upstream/main` into this branch; the three changes above are isolated to small, well-marked surfaces and rebase cleanly.
+**Upstream tracking:** watch [`heggria/pi-taskflow`](https://github.com/heggria/pi-taskflow) for upstream releases. To re-sync, merge `upstream/main` into this branch; the changes above are isolated to small, well-marked surfaces and rebase cleanly.
 
 ---
 
