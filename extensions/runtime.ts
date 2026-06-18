@@ -12,6 +12,7 @@
 
 import * as path from "node:path";
 import * as fs from "node:fs";
+import { spawn } from "node:child_process";
 import type { AgentConfig } from "./agents.ts";
 import { coerceArray, evaluateCondition, interpolate, type InterpolationContext, safeParse, tryEvaluateCondition } from "./interpolate.ts";
 import { isFailed, isTransientError, type LiveUpdate, mapWithConcurrencyLimit, runAgentTask, type RunResult } from "./runner.ts";
@@ -820,6 +821,57 @@ async function executePhaseInner(
 			return r;
 		});
 	};
+
+	// Deterministic shell step: run `bash -c <cmd>` with NO subagent. Exit code
+	// maps to status (0=done, non-zero=failed); stdout (trimmed) is the output;
+	// usage is zero. Author-trust only — forbidden in dynamic sub-flows (schema).
+	if (type === "exec") {
+		const command = interpolate(phase.cmd ?? "", ctx).text;
+		const inputHash = cacheKey(cc, [phase.id, "exec", command]);
+		const cached = cachedPhase(cc, inputHash);
+		if (cached) return cached;
+		const timeoutMs = phase.timeoutMs ?? 600_000;
+		const ps = await new Promise<PhaseState>((resolve) => {
+			const child = spawn("bash", ["-c", command], { cwd: effCwd, env: process.env });
+			let out = "";
+			let err = "";
+			let timedOut = false;
+			const onAbort = () => child.kill("SIGTERM");
+			deps.signal?.addEventListener?.("abort", onAbort);
+			const timer =
+				timeoutMs > 0
+					? setTimeout(() => {
+							timedOut = true;
+							child.kill("SIGTERM");
+						}, timeoutMs)
+					: undefined;
+			child.stdout?.on("data", (d) => { out += d; });
+			child.stderr?.on("data", (d) => { err += d; });
+			const finish = (p: PhaseState) => {
+				if (timer) clearTimeout(timer);
+				deps.signal?.removeEventListener?.("abort", onAbort);
+				resolve(p);
+			};
+			child.on("error", (e) =>
+				finish({ id: phase.id, status: "failed", output: "", error: `exec spawn failed: ${e.message}`, usage: emptyUsage(), inputHash, endedAt: Date.now() }),
+			);
+			child.on("close", (code) => {
+				const output = out.trim();
+				if (timedOut) {
+					finish({ id: phase.id, status: "failed", output, error: `exec timed out after ${timeoutMs}ms`, usage: emptyUsage(), inputHash, endedAt: Date.now() });
+					return;
+				}
+				if (code === 0) {
+					finish({ id: phase.id, status: "done", output, json: parseJson ? safeParse(output) : undefined, usage: emptyUsage(), inputHash, endedAt: Date.now() });
+					return;
+				}
+				const errMsg = `exec exited ${code}${err.trim() ? `: ${err.trim().slice(0, 500)}` : ""}`;
+				finish({ id: phase.id, status: "failed", output, error: errMsg, usage: emptyUsage(), inputHash, endedAt: Date.now() });
+			});
+		});
+		recordCache(cc, ps);
+		return ps;
+	}
 
 	// Single-agent phases: agent, gate, and reduce all run one subagent on an
 	// interpolated task. gate additionally parses a verdict; reduce simply pulls
