@@ -12,6 +12,7 @@
 import { readFileSync } from "node:fs";
 import { type AgentScope, discoverAgents, readSubagentSettings } from "./agents.ts";
 import { executeTaskflow } from "./runtime.ts";
+import { startTracing } from "./otel/setup.ts";
 import { getFlow, loadRun, saveRun, DEFAULT_KEPT_RUNS, DEFAULT_RUN_AGE_DAYS } from "./store.ts";
 
 interface DetachContext {
@@ -51,17 +52,26 @@ try {
 	const scope: AgentScope = state.def.agentScope ?? "user";
 	const { agents } = discoverAgents(ctx.cwd, scope, settings.modelRoles, settings.providerRoles, settings.taskflow);
 
-	const result = await executeTaskflow(state, {
-		cwd: ctx.cwd,
-		agents,
-		globalThinking: settings.globalThinking,
-		persist: (s) => saveRun(s, cleanupConfig),
-		// No requestApproval — approval phases auto-reject in detached/CI mode
-		// (safety: approval gates are never bypassed; the run records the rejection).
-		loadFlow: (name: string) => getFlow(ctx.cwd, name)?.def,
-	});
+	// Opt-in OpenTelemetry (same env gate as the host). Background runs live in
+	// their own process, so we MUST flush spans before exiting or they're lost.
+	const tracing = startTracing();
 
-	saveRun(result.state, cleanupConfig);
+	try {
+		const result = await executeTaskflow(state, {
+			cwd: ctx.cwd,
+			agents,
+			globalThinking: settings.globalThinking,
+			persist: (s) => saveRun(s, cleanupConfig),
+			// No requestApproval — approval phases auto-reject in detached/CI mode
+			// (safety: approval gates are never bypassed; the run records the rejection).
+			loadFlow: (name: string) => getFlow(ctx.cwd, name)?.def,
+			tracer: tracing?.tracer,
+		});
+
+		saveRun(result.state, cleanupConfig);
+	} finally {
+		await tracing?.shutdown();
+	}
 } catch (e) {
 	// Top-level catch: persist failure so the host can poll the terminal state.
 	const message = e instanceof Error ? e.message : String(e);
