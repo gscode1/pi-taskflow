@@ -1156,11 +1156,41 @@ function errorResult(action: string, message: string): ToolResult {
 	};
 }
 
+/**
+ * Identify why a run did not succeed and return a one-line, actionable cause.
+ * Without this, a non-interactive caller (a /loop tick, a subagent, CI) only
+ * sees the word "blocked" plus the final phase's (often empty/skipped) output,
+ * with no hint of which phase halted the flow or why — so it cannot self-correct.
+ */
+function blockingCause(state: RuntimeResult["state"]): string | undefined {
+	for (const ps of Object.values(state.phases)) {
+		// A gate or rejected-approval phase that blocked.
+		if (ps.gate?.verdict === "block") {
+			const reason = ps.gate.reason?.replace(/\s+/g, " ").trim();
+			let line = `Halted at '${ps.id}'${reason ? `: ${reason}` : " (blocked)"}`;
+			// The most common headless trap: an approval gate with no UI approver.
+			if (ps.approval?.auto && ps.approval.decision === "reject") {
+				line += " — pass hitl=false (or wire an interactive approver) for non-interactive runs.";
+			}
+			return line;
+		}
+		// A hard phase failure (e.g. ingest got empty feedback).
+		if (ps.status === "failed" && ps.error) {
+			return `Failed at '${ps.id}': ${ps.error.replace(/\s+/g, " ").trim()}`;
+		}
+	}
+	return undefined;
+}
+
 function finalResult(action: string, result: RuntimeResult): ToolResult {
 	const fp = finalPhase(result.state.def.phases);
-	const header = result.ok
+	let header = result.ok
 		? `Taskflow '${result.state.flowName}' completed (${summarizeRun(result.state)}). Run id: ${result.state.runId}`
 		: `Taskflow '${result.state.flowName}' ${result.state.status} (${summarizeRun(result.state)}). Run id: ${result.state.runId} — resume with action=resume.`;
+	if (!result.ok) {
+		const cause = blockingCause(result.state);
+		if (cause) header += `\n${cause}`;
+	}
 	return {
 		content: [{ type: "text", text: `${header}\n\n--- ${fp.id} ---\n${result.finalOutput}` }],
 		details: { action, state: result.state, finalOutput: result.finalOutput },
