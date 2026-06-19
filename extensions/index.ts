@@ -12,7 +12,7 @@
 
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import {
 	RECOMMENDED_DEFAULTS,
@@ -327,6 +327,14 @@ export default function (pi: ExtensionAPI) {
 		return;
 	}
 
+	const sendCommandTurn = async (cmdCtx: ExtensionCommandContext, prompt: string) => {
+		pi.sendUserMessage(prompt);
+		if (!cmdCtx.hasUI) {
+			await new Promise((resolve) => setImmediate(resolve));
+			await cmdCtx.waitForIdle();
+		}
+	};
+
 	// ---- Register per-saved-flow shortcut commands on session start ----
 	const registerSavedFlowCommands = (ctx: ExtensionContext) => {
 		const flows = listFlows(ctx.cwd);
@@ -340,7 +348,8 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					const parsed = parseArgsString(args, flow.def);
-					pi.sendUserMessage(
+					await sendCommandTurn(
+						cmdCtx,
 						`Run the saved taskflow "${flow.name}" using the taskflow tool with action="run", name="${flow.name}", args=${JSON.stringify(parsed)}.`,
 					);
 				},
@@ -689,7 +698,8 @@ export default function (pi: ExtensionAPI) {
 					handler: async (args, cmdCtx) => {
 						const parsed = parseArgsString(args, def!);
 						if (cmdCtx.isIdle())
-							pi.sendUserMessage(
+							await sendCommandTurn(
+								cmdCtx,
 								`Run the saved taskflow "${def!.name}" using the taskflow tool with action="run", name="${def!.name}", args=${JSON.stringify(parsed)}.`,
 							);
 					},
@@ -862,7 +872,8 @@ export default function (pi: ExtensionAPI) {
 				});
 				if (result?.action === "resume") {
 					if (ctx.isIdle()) {
-						pi.sendUserMessage(
+						await sendCommandTurn(
+							ctx,
 							`Resume the taskflow run "${result.runId}" using the taskflow tool with action="resume", runId="${result.runId}".`,
 						);
 					} else {
@@ -888,7 +899,8 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				const parsed = parseArgsString(maybeArgs.join(" "), flow.def);
-				pi.sendUserMessage(
+				await sendCommandTurn(
+					ctx,
 					`Run the saved taskflow "${name}" using the taskflow tool with action="run", name="${name}", args=${JSON.stringify(parsed)}.`,
 				);
 				return;
@@ -903,7 +915,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("Agent is busy; try again when idle.", "warning");
 					return;
 				}
-				pi.sendUserMessage(`Resume the taskflow run "${arg}" using the taskflow tool with action="resume", runId="${arg}".`);
+				await sendCommandTurn(ctx, `Resume the taskflow run "${arg}" using the taskflow tool with action="resume", runId="${arg}".`);
 				return;
 			}
 
