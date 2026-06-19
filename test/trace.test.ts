@@ -115,6 +115,10 @@ test("trace: emits run → phase → subagent span hierarchy", async () => {
 	// Run-level attributes.
 	assert.equal(run.attributes["taskflow.name"], "trace-flow");
 	assert.equal(run.attributes["taskflow.run_id"], "trace-1");
+
+	// EVERY span carries the run id so any span is filterable by run without
+	// having to walk up to the root span.
+	assert.ok(spans.every((s) => s.attributes["taskflow.run_id"] === "trace-1"), "every span must carry taskflow.run_id");
 	assert.equal(run.attributes["taskflow.phase_count"], 2);
 	assert.equal(run.attributes["taskflow.status"], "completed");
 	assert.equal(run.status?.ok, true);

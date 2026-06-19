@@ -725,6 +725,8 @@ async function executePhaseInner(
 				"agent.provider": phase.provider ?? "pi",
 				"phase.id": phase.id,
 				"gen_ai.request.model": phase.model,
+				"taskflow.run_id": state.runId,
+				"taskflow.name": state.flowName,
 			},
 		});
 		try {
@@ -1983,7 +1985,12 @@ async function runTaskflowLayers(state: RunState, deps: RuntimeDeps): Promise<Ru
 				const skipSpan = skipTracer.startSpan(SPAN.phase, {
 					startTime: skippedAt,
 					parent: deps._parentSpan,
-					attributes: { "phase.id": phase.id, "phase.type": phase.type ?? "agent" },
+					attributes: {
+						"phase.id": phase.id,
+						"phase.type": phase.type ?? "agent",
+						"taskflow.run_id": state.runId,
+						"taskflow.name": state.flowName,
+					},
 				});
 				setPhaseDefAttributes(skipSpan, phase);
 				skipSpan.setAttributes({ "phase.status": "skipped", "phase.skip_reason": skipReason });
@@ -2019,6 +2026,8 @@ async function runTaskflowLayers(state: RunState, deps: RuntimeDeps): Promise<Ru
 				attributes: {
 					"phase.id": phase.id,
 					"phase.type": phase.type ?? "agent",
+					"taskflow.run_id": state.runId,
+					"taskflow.name": state.flowName,
 				},
 			});
 			setPhaseDefAttributes(phaseSpan, phase);
