@@ -30,6 +30,25 @@ All notable changes to pi-taskflow are documented here. This project follows [Ke
     `extensions/otel/setup.ts`, `extensions/runtime.ts` (`executeTaskflow`,
     per-phase span, `baseRun`), `extensions/index.ts` + `extensions/detached-runner.ts`
     (activation), `test/trace.test.ts`, `test/otel-setup.test.ts`.
+- **Richer span attributes for monitoring/troubleshooting.** Spans now carry
+  much more diagnostic detail (no prompt/output *content* — only lengths — to
+  avoid secret leakage and cardinality blowups):
+  - **Skipped phases now emit a span** (previously invisible) with
+    `phase.skip_reason`, so a trace shows *why* a phase didn't run (unmet
+    dependency, gate-blocked, budget, failed `when`).
+  - **Phase topology:** `phase.agent`, `phase.depends_on(_count)`, `phase.join`,
+    `phase.optional`, `phase.provider`, `phase.cwd`, `phase.timeout_ms`,
+    `phase.has_when`.
+  - **Type-specific outcomes:** `gate.verdict`/`gate.reason`,
+    `approval.decision`/`approval.auto`, `loop.iterations`/`loop.stop`,
+    `tournament.*`, fan-out `fanout.total`/`done`/`failed`,
+    `phase.budget_truncated`, `phase.def_error`, `phase.warnings_count`,
+    `phase.output_chars`.
+  - **Subagent failure detail:** `subagent.exit_code`, `subagent.attempts`,
+    `subagent.stop_reason`, `subagent.timeout`, `subagent.idle_timeout`.
+  - **Run rollups:** `taskflow.cwd`, `taskflow.concurrency`, `taskflow.max_usd`,
+    `taskflow.arg_count`, `taskflow.resumed`, and terminal
+    `taskflow.phases_done`/`phases_failed`/`phases_skipped`.
 
 ## [0.0.23] — 2026-06-11
 

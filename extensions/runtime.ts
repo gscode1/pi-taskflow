@@ -37,6 +37,44 @@ function setUsageAttributes(span: SpanLike, u: UsageStats | undefined): void {
 	});
 }
 
+/** Static, definition-time phase topology — known before the phase runs. */
+function setPhaseDefAttributes(span: SpanLike, phase: Phase): void {
+	const deps = dependenciesOf(phase);
+	span.setAttributes({
+		"phase.agent": phase.agent,
+		"phase.depends_on": deps.length ? deps.join(",") : undefined,
+		"phase.depends_on_count": deps.length,
+		"phase.join": deps.length ? (phase.join ?? "all") : undefined,
+		"phase.optional": phase.optional ?? false,
+		"phase.provider": phase.provider,
+		"phase.cwd": phase.cwd,
+		"phase.timeout_ms": phase.timeoutMs,
+		"phase.has_when": phase.when !== undefined,
+	});
+}
+
+/** Dynamic, type-specific phase outcome — known only after the phase runs. */
+function setPhaseOutcomeAttributes(span: SpanLike, ps: PhaseState): void {
+	span.setAttributes({
+		"phase.status": ps.status,
+		"phase.attempts": ps.attempts,
+		"phase.model": ps.model,
+		"cache.hit": ps.cacheHit ?? false,
+		"phase.budget_truncated": ps.budgetTruncated ?? false,
+		"phase.warnings_count": ps.warnings?.length ?? undefined,
+		"phase.def_error": ps.defError,
+		"phase.output_chars": ps.output?.length ?? undefined,
+	});
+	if (ps.gate) span.setAttributes({ "gate.verdict": ps.gate.verdict, "gate.reason": ps.gate.reason });
+	if (ps.approval)
+		span.setAttributes({ "approval.decision": ps.approval.decision, "approval.auto": ps.approval.auto ?? false, "approval.note": ps.approval.note });
+	if (ps.loop) span.setAttributes({ "loop.iterations": ps.loop.iterations, "loop.stop": ps.loop.stop });
+	if (ps.tournament)
+		span.setAttributes({ "tournament.variants": ps.tournament.variants, "tournament.winner": ps.tournament.winner, "tournament.mode": ps.tournament.mode, "tournament.reason": ps.tournament.reason });
+	if (ps.subProgress)
+		span.setAttributes({ "fanout.total": ps.subProgress.total, "fanout.done": ps.subProgress.done, "fanout.failed": ps.subProgress.failed });
+}
+
 /** A human-in-the-loop approval request raised by an `approval` phase. */
 export interface ApprovalRequest {
 	phaseId: string;
@@ -709,7 +747,14 @@ async function executePhaseInner(
 				},
 				deps.globalThinking,
 			);
-			span.setAttributes({ "gen_ai.response.model": r.model });
+			span.setAttributes({
+				"gen_ai.response.model": r.model,
+				"subagent.exit_code": r.exitCode,
+				"subagent.attempts": r.attempts,
+				"subagent.stop_reason": r.stopReason,
+				"subagent.timeout": r.timeout ?? false,
+				"subagent.idle_timeout": r.idleTimeout ?? false,
+			});
 			setUsageAttributes(span, r.usage);
 			const failed = isFailed(r);
 			span.setStatus({ ok: !failed, message: failed ? r.errorMessage || r.stderr : undefined });
@@ -1820,15 +1865,29 @@ export async function executeTaskflow(state: RunState, deps: RuntimeDeps): Promi
 			"taskflow.run_id": state.runId,
 			"taskflow.phase_count": def.phases.length,
 			"taskflow.detached": state.detached ?? false,
+			"taskflow.cwd": state.cwd,
+			"taskflow.concurrency": def.concurrency ?? 8,
+			"taskflow.max_usd": def.budget?.maxUSD,
+			"taskflow.arg_count": Object.keys(state.args ?? {}).length,
+			"taskflow.resumed": Object.keys(state.phases ?? {}).length > 0,
 		},
 	});
 	// Child spans below the root parent to the run span.
 	const tracedDeps: RuntimeDeps = { ...deps, _parentSpan: runSpan };
 	try {
 		const result = await runTaskflowLayers(state, tracedDeps);
+		const counts = { done: 0, failed: 0, skipped: 0 };
+		for (const p of Object.values(result.state.phases)) {
+			if (p.status === "done") counts.done++;
+			else if (p.status === "failed") counts.failed++;
+			else if (p.status === "skipped") counts.skipped++;
+		}
 		runSpan.setAttributes({
 			"taskflow.status": result.state.status,
 			"taskflow.total_cost_usd": result.totalUsage.cost,
+			"taskflow.phases_done": counts.done,
+			"taskflow.phases_failed": counts.failed,
+			"taskflow.phases_skipped": counts.skipped,
 		});
 		setUsageAttributes(runSpan, result.totalUsage);
 		runSpan.setStatus({ ok: result.ok });
@@ -1909,13 +1968,27 @@ async function runTaskflowLayers(state: RunState, deps: RuntimeDeps): Promise<Ru
 
 			if (skipReason) {
 				if (skipReason.startsWith("Budget exceeded")) budgetBlocked = true;
+				const skippedAt = Date.now();
 				state.phases[phase.id] = {
 					id: phase.id,
 					status: "skipped",
 					error: skipReason,
-					endedAt: Date.now(),
+					endedAt: skippedAt,
 					usage: emptyUsage(),
 				};
+				// Emit a span for skipped phases too — a trace that shows WHY a phase
+				// didn't run (unmet dep, gate-blocked, budget, failed `when`) is the
+				// single most useful thing when debugging a flow that "did nothing".
+				const skipTracer = deps.tracer ?? NOOP_TRACER;
+				const skipSpan = skipTracer.startSpan(SPAN.phase, {
+					startTime: skippedAt,
+					parent: deps._parentSpan,
+					attributes: { "phase.id": phase.id, "phase.type": phase.type ?? "agent" },
+				});
+				setPhaseDefAttributes(skipSpan, phase);
+				skipSpan.setAttributes({ "phase.status": "skipped", "phase.skip_reason": skipReason });
+				skipSpan.setStatus({ ok: true });
+				skipSpan.end(skippedAt);
 				safeEmit(deps, state);
 				return;
 			}
@@ -1948,15 +2021,11 @@ async function runTaskflowLayers(state: RunState, deps: RuntimeDeps): Promise<Ru
 					"phase.type": phase.type ?? "agent",
 				},
 			});
+			setPhaseDefAttributes(phaseSpan, phase);
 			const ps = await executePhase(phase, state, { ...deps, _parentSpan: phaseSpan }, prior, () =>
 				safeProgress(deps, state),
 			);
-			phaseSpan.setAttributes({
-				"phase.status": ps.status,
-				"phase.attempts": ps.attempts,
-				"phase.model": ps.model,
-				"cache.hit": ps.cacheHit ?? false,
-			});
+			setPhaseOutcomeAttributes(phaseSpan, ps);
 			setUsageAttributes(phaseSpan, ps.usage);
 			if (ps.status === "failed") phaseSpan.setStatus({ ok: false, message: ps.error });
 			else phaseSpan.setStatus({ ok: true });
