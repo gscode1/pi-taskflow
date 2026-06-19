@@ -844,7 +844,10 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (!ctx.hasUI) {
 					ctx.ui.notify(
-						runs.map((r) => `${r.runId} [${r.status}] ${r.flowName} — ${summarizeRun(r)}`).join("\n"),
+						runs.map((r) => {
+							const bg = r.detached ? ` (background, pid ${r.pid ?? "?"})` : "";
+							return `${r.runId} [${r.status}]${bg} ${r.flowName} — ${summarizeRun(r)}`;
+						}).join("\n"),
 						"info",
 					);
 					return;

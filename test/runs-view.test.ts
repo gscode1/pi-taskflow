@@ -21,6 +21,25 @@ function mkRun(over: Partial<RunState> = {}): RunState {
 	} as RunState;
 }
 
+test("runs-view: detached run shows a background tag in the list + pid in detail", () => {
+	const detached = mkRun({ runId: "flow-bg", flowName: "bg-flow", status: "running", detached: true, pid: 4242 });
+	const view = new RunHistoryComponent([detached], theme, () => {});
+	try {
+		// List mode: background marker next to the flow name.
+		const list = view.render(80).join("\n");
+		assert.ok(list.includes("⤳bg"), "list row should carry a background tag");
+
+		// Detail mode (Enter on the row) surfaces the pid. Render at a different
+		// width to bypass the width-keyed render cache.
+		view.handleInput("\r");
+		const detail = view.render(100).join("\n");
+		assert.ok(detail.includes("background"), "detail view labels the run as background");
+		assert.ok(detail.includes("4242"), "detail view shows the pid");
+	} finally {
+		view.dispose();
+	}
+});
+
 test("runs-view: live refresh re-reads and requestRender fires when state changes", async () => {
 	const initial = [mkRun({ status: "running", updatedAt: 1000 })];
 	let snapshot = [mkRun({ status: "running", updatedAt: 1000 })];
