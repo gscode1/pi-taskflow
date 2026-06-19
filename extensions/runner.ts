@@ -131,6 +131,18 @@ export function isTransientError(r: RunResult): boolean {
 	return TRANSIENT_ERROR_RE.test(hay);
 }
 
+/**
+ * Did this failure exceed the wall-clock or idle watchdog? Such failures are
+ * deterministic stalls: re-running just repeats the same hang and burns the
+ * budget. `isTransientError` already excludes them from the transient-retry
+ * fallback; the explicit retry policy must short-circuit on them too, otherwise
+ * a `retry: {max:N}` on a gate re-runs an N×600s timeout (see dev-issue-to-pr
+ * run mqkzp8pk: 3 × ~600s wall-clock, $0.38, no verdict).
+ */
+export function isDeterministicStall(r: RunResult): boolean {
+	return r.stopReason === "error" && Boolean(r.idleTimeout || r.timeout);
+}
+
 /** Placeholder written to a failed phase's `output` so downstream interpolation
  *  can detect "upstream failed" without being polluted by raw HTML/JSON. */
 export const TRANSPORT_ERROR_PLACEHOLDER = "(upstream error: subagent failed; see error)";

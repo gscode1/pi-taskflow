@@ -15,7 +15,7 @@ import * as fs from "node:fs";
 import { spawn } from "node:child_process";
 import type { AgentConfig } from "./agents.ts";
 import { coerceArray, evaluateCondition, interpolate, type InterpolationContext, safeParse, tryEvaluateCondition } from "./interpolate.ts";
-import { isFailed, isTransientError, type LiveUpdate, mapWithConcurrencyLimit, runAgentTask, type RunResult } from "./runner.ts";
+import { isDeterministicStall, isFailed, isTransientError, type LiveUpdate, mapWithConcurrencyLimit, runAgentTask, type RunResult } from "./runner.ts";
 import { aggregateUsage, emptyUsage, type UsageStats } from "./usage.ts";
 import { type Budget, type CacheScope, dependenciesOf, finalPhase, LOOP_DEFAULT_MAX_ITERATIONS, LOOP_HARD_MAX_ITERATIONS, MAX_DYNAMIC_MAP_ITEMS, MAX_DYNAMIC_NESTING, parseTtlMs, type Phase, resolveArgs, type Taskflow, topoLayers, TOURNAMENT_DEFAULT_VARIANTS, TOURNAMENT_HARD_MAX_VARIANTS, type TournamentMode, validateTaskflow } from "./schema.ts";
 import { verifyTaskflow } from "./verify.ts";
@@ -713,6 +713,18 @@ async function executePhaseInner(
 		preRead,
 	};
 
+	// Gate phases converge fast on well-formed evidence (the dev-issue-to-pr gate
+	// normally finishes in 6–13 turns / under 3 min). The global 10-min wall-clock
+	// / 5-min idle defaults let a stuck reviewer stream for the full window before
+	// dying; a tighter gate budget makes such a stall fail fast instead of burning
+	// ~30 min × $0.38 across retries. Explicit phase timeoutMs still wins.
+	const GATE_DEFAULT_TIMEOUT_MS = 5 * 60_000;
+	const GATE_DEFAULT_IDLE_TIMEOUT_MS = 2 * 60_000;
+	const gateDefaults =
+		type === "gate"
+			? { timeoutMs: GATE_DEFAULT_TIMEOUT_MS, idleTimeoutMs: GATE_DEFAULT_IDLE_TIMEOUT_MS }
+			: { timeoutMs: undefined as number | undefined, idleTimeoutMs: undefined as number | undefined };
+
 	const tracer = deps.tracer ?? NOOP_TRACER;
 	// One span per subagent spawn (each fan-out item, loop iteration, tournament
 	// candidate, and retry attempt is a distinct call to baseRun → distinct span),
@@ -740,7 +752,8 @@ async function executePhaseInner(
 					model: phase.model,
 					thinking: phase.thinking,
 					tools: phase.tools,
-					timeoutMs: phase.timeoutMs,
+					timeoutMs: phase.timeoutMs ?? gateDefaults.timeoutMs,
+					idleTimeoutMs: gateDefaults.idleTimeoutMs,
 					cwd: effCwd,
 					signal: deps.signal,
 					onLive,
@@ -798,6 +811,11 @@ async function executePhaseInner(
 			if (!isFailed(last)) break;
 			// Stop retrying on abort or once the run is over budget.
 			if (deps.signal?.aborted || overBudget(state).over) break;
+			// A wall-clock/idle timeout is a deterministic stall: re-running just
+			// repeats the same hang. Stop immediately even under an explicit retry
+			// policy, so e.g. a gate's `retry: {max:2}` can't burn 3×600s on a stuck
+			// reviewer (the transient fallback already excludes these).
+			if (isDeterministicStall(last)) break;
 			// Decide whether THIS failure warrants another attempt. Explicit retry
 			// policy covers all failures up to its cap; the transient fallback covers
 			// only retryable provider errors. A non-transient failure with no explicit

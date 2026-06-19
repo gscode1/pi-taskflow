@@ -390,6 +390,57 @@ test("runtime: gate PASS lets the flow continue", async () => {
 	assert.equal(res.state.phases.ship.status, "done");
 });
 
+test("runtime: gate wall-clock timeout under explicit retry policy stops after one attempt", async () => {
+	// Regression for run mqkzp8pk: a gate with retry:{max:2} that wall-clock
+	// timed out re-ran the same ~600s stall 3× ($0.38, no verdict). A deterministic
+	// stall must short-circuit the explicit retry loop — exactly one attempt.
+	const def: Taskflow = {
+		name: "gate-timeout",
+		phases: [
+			{ id: "work", type: "agent", agent: "a", task: "do work" },
+			{
+				id: "check",
+				type: "gate",
+				agent: "a",
+				task: "review {steps.work.output}",
+				dependsOn: ["work"],
+				onBlock: "retry",
+				retry: { max: 2, backoffMs: 0 },
+			},
+		],
+	};
+	let gateCalls = 0;
+	const runTask: RuntimeDeps["runTask"] = async (_cwd, _agents, agentName, task): Promise<RunResult> => {
+		if (task.startsWith("review")) {
+			gateCalls++;
+			return {
+				agent: agentName,
+				task,
+				exitCode: 1,
+				output: "",
+				stderr: "",
+				usage: { ...emptyUsage(), output: 10, cost: 0.13, turns: 100 },
+				stopReason: "error",
+				timeout: true,
+				errorMessage: "Subagent exceeded wall-clock timeout of 300s — killed",
+			};
+		}
+		return {
+			agent: agentName,
+			task,
+			exitCode: 0,
+			output: `ok:${task}`,
+			stderr: "",
+			usage: { ...emptyUsage(), output: 10, cost: 0.001, turns: 1 },
+			stopReason: "end",
+		};
+	};
+	const res = await executeTaskflow(mkState(def), baseDeps(runTask));
+	assert.equal(gateCalls, 1, "wall-clock timeout must not be retried under explicit retry policy");
+	assert.equal(res.state.phases.check.status, "failed");
+	assert.equal(res.state.phases.check.usage?.turns, 100);
+});
+
 test("runtime: completed phases retain startedAt (run elapsed regression)", async () => {
 	const def: Taskflow = {
 		name: "timed",

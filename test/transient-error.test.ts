@@ -4,7 +4,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { isTransientError, type RunResult } from "../extensions/runner.ts";
+import { isDeterministicStall, isTransientError, type RunResult } from "../extensions/runner.ts";
 import { emptyUsage } from "../extensions/usage.ts";
 
 function mkResult(overrides: Partial<RunResult> = {}): RunResult {
@@ -96,4 +96,17 @@ test("isTransientError: idle timeout is never transient (deterministic stall)", 
 test("isTransientError: non-idle-timeout errors are still transient", () => {
 	assert.equal(isTransientError(mkResult({ stopReason: "error", errorMessage: "rate limit" })), true);
 	assert.equal(isTransientError(mkResult({ stopReason: "error", idleTimeout: false, errorMessage: "429" })), true);
+});
+
+// ── isDeterministicStall (gate retry-burn fix) ─────────────────────
+
+test("isDeterministicStall: wall-clock and idle timeouts are deterministic stalls", () => {
+	assert.equal(isDeterministicStall(mkResult({ stopReason: "error", timeout: true })), true);
+	assert.equal(isDeterministicStall(mkResult({ stopReason: "error", idleTimeout: true })), true);
+});
+
+test("isDeterministicStall: non-timeout failures and successes are not stalls", () => {
+	assert.equal(isDeterministicStall(mkResult({ stopReason: "error", errorMessage: "rate limit" })), false);
+	assert.equal(isDeterministicStall(mkResult({ stopReason: "aborted", timeout: true })), false);
+	assert.equal(isDeterministicStall(mkResult()), false);
 });
