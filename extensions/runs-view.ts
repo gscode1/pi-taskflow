@@ -164,6 +164,11 @@ export class RunHistoryComponent {
 			lines.push("");
 			for (const l of renderProgress(run, th).split("\n")) lines.push(truncateToWidth(l, width));
 			lines.push("");
+			if (run.detached) {
+				const aliveTag = run.status === "running" ? th.fg("success", " (running)") : "";
+				lines.push(truncateToWidth(`  ${th.fg("accent", "background")}${th.fg("dim", ` · pid ${run.pid ?? "?"}`)}${aliveTag}`, width));
+				lines.push("");
+			}
 			const hint = isResumable(run) ? "Esc back · r resume" : "Esc back";
 			const liveTag = this.timer && run.status === "running" ? th.fg("success", " ● live") : "";
 			lines.push(truncateToWidth(`  ${th.fg("dim", hint)}${liveTag}`, width));
@@ -186,8 +191,10 @@ export class RunHistoryComponent {
 			const marker = sel ? th.fg("accent", "❯ ") : "  ";
 			const badge = statusBadge(run.status, th);
 			const name = sel ? th.fg("text", run.flowName) : th.fg("muted", run.flowName);
+			// Mark detached (background) runs so they're identifiable at a glance.
+			const bgTag = run.detached ? th.fg("accent", " ⤳bg") : "";
 			const meta = th.fg("dim", `${summarizeRun(run)} · ${timeAgo(run.updatedAt)}`);
-			lines.push(truncateToWidth(`  ${marker}${badge}  ${name}  ${meta}`, width));
+			lines.push(truncateToWidth(`  ${marker}${badge}  ${name}${bgTag}  ${meta}`, width));
 		});
 
 		lines.push("");
