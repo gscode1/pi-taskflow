@@ -832,6 +832,59 @@ export function listRuns(cwd: string, limit = 20): RunState[] {
 	return runs.filter((r) => typeof r.updatedAt === "number" && !Number.isNaN(r.updatedAt));
 }
 
+/**
+ * Permanently delete a single run: its state file, lock file, index entry, and
+ * the per-run Shared Context Tree + isolated-workspace directories. Mirrors the
+ * reclamation done by `cleanupTerminalRuns`, but for one explicitly-named run.
+ *
+ * Returns `{ deleted: false }` when the run does not exist. Does NOT guard
+ * against deleting a "running" run — callers (e.g. the `/tf delete` command)
+ * are responsible for refusing to delete an actively-running detached run.
+ */
+export function deleteRun(cwd: string, runId: string): { deleted: boolean } {
+	if (!validateRunId(runId)) return { deleted: false };
+	const root = runsDir(cwd);
+	if (!fs.existsSync(root)) return { deleted: false };
+
+	// Resolve the run file path: prefer the index relPath, else fall back to the
+	// canonical per-flow path (via loadRun's flowName), else legacy flat layout.
+	let relPath: string | undefined;
+	withLock(indexLockPath(root), () => {
+		const entries = readIndex(root);
+		relPath = entries.find((e) => e.runId === runId)?.relPath;
+	});
+	let filePath: string | undefined = relPath ? path.join(root, relPath) : undefined;
+	if (!filePath || !fs.existsSync(filePath)) {
+		const state = loadRun(cwd, runId);
+		if (state) filePath = runFilePath(root, state.flowName, runId);
+	}
+
+	let removedFile = false;
+	if (filePath && fs.existsSync(filePath)) {
+		try { fs.unlinkSync(filePath); removedFile = true; } catch { /* already gone */ }
+		try { fs.unlinkSync(filePath + ".lock"); } catch { /* ignore */ }
+		// Remove the now-empty per-flow subdirectory, if any.
+		try { fs.rmdirSync(path.dirname(filePath)); } catch { /* ENOTEMPTY/ENOENT — ignore */ }
+	}
+
+	// Drop the index entry (whether or not the file existed — self-heal).
+	let removedEntry = false;
+	withLock(indexLockPath(root), () => {
+		const entries = readIndex(root);
+		const next = entries.filter((e) => e.runId !== runId);
+		if (next.length !== entries.length) { writeIndex(root, next); removedEntry = true; }
+	});
+
+	// Reclaim the per-run Shared Context Tree + dedicated-workspace dirs.
+	try { fs.rmSync(path.join(root, "ctx", runId), { recursive: true, force: true }); } catch { /* ignore */ }
+	try {
+		const wsSeg = runId.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "_").slice(0, 100) || "phase";
+		fs.rmSync(path.join(root, "ws", wsSeg), { recursive: true, force: true });
+	} catch { /* ignore */ }
+
+	return { deleted: removedFile || removedEntry };
+}
+
 /** Stable hash of a phase's resolved task + inputs, for resume caching. */
 export function hashInput(...parts: string[]): string {
 	return crypto.createHash("sha256").update(parts.join("\u0000")).digest("hex").slice(0, 16);

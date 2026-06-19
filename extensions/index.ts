@@ -32,7 +32,9 @@ import { executeTaskflow, type ApprovalDecision, type ApprovalRequest, type Runt
 import { startTracing, type TracingSession } from "./otel/setup.ts";
 import { finalPhase, resolveArgs, type Taskflow, validateTaskflow, desugar, isShorthand } from "./schema.ts";
 import {
+	deleteRun,
 	getFlow,
+	isProcessAlive,
 	listFlows,
 	listRuns,
 	loadRun,
@@ -84,8 +86,8 @@ const ShorthandStep = Type.Object(
 );
 
 const TaskflowParams = Type.Object({
-	action: StringEnum(["run", "save", "resume", "list", "agents", "init", "verify", "cache-clear"] as const, {
-		description: "What to do: run a flow, save a definition, resume a paused run, list saved flows, list available agents, init model role configuration, or clear the cross-run memoization cache",
+	action: StringEnum(["run", "save", "resume", "pause", "delete", "list", "agents", "init", "verify", "cache-clear"] as const, {
+		description: "What to do: run a flow, save a definition, resume a paused run, pause a running detached run, delete a run, list saved flows, list available agents, init model role configuration, or clear the cross-run memoization cache",
 		default: "run",
 	}),
 	name: Type.Optional(Type.String({ description: "Name of a saved flow (for run/save without inline define)" })),
@@ -596,6 +598,22 @@ export default function (pi: ExtensionAPI) {
 				return finalResult(action, result);
 			}
 
+			// pause
+			if (action === "pause") {
+				if (!params.runId) return errorResult(action, "action=pause requires 'runId'");
+				const r = pauseRunById(ctx.cwd, params.runId);
+				if (!r.ok) return errorResult(action, r.message);
+				return { content: [{ type: "text", text: r.message }], details: { action, message: params.runId } satisfies TaskflowDetails };
+			}
+
+			// delete
+			if (action === "delete") {
+				if (!params.runId) return errorResult(action, "action=delete requires 'runId'");
+				const r = deleteRunById(ctx.cwd, params.runId);
+				if (!r.ok) return errorResult(action, r.message);
+				return { content: [{ type: "text", text: r.message }], details: { action, message: params.runId } satisfies TaskflowDetails };
+			}
+
 			// resolve the definition: inline `define` / shorthand (single|parallel|chain), else saved `name`.
 			let def: Taskflow | undefined;
 
@@ -787,9 +805,9 @@ export default function (pi: ExtensionAPI) {
 
 	// ---- The /tf user command ----
 	pi.registerCommand("tf", {
-		description: "Taskflow: list | run <name> | show <name> | runs | init",
+		description: "Taskflow: list | run <name> | show <name> | runs | resume <id> | pause <id> | delete <id> | init",
 		getArgumentCompletions: (prefix) => {
-			const subs = ["list", "run", "show", "runs", "resume", "init", "save", "verify"];
+			const subs = ["list", "run", "show", "runs", "resume", "pause", "delete", "init", "save", "verify"];
 			const items = subs.map((s) => ({ value: s, label: s }));
 			const filtered = items.filter((i) => i.value.startsWith(prefix));
 			return filtered.length > 0 ? filtered : null;
@@ -886,6 +904,26 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			if (sub === "pause") {
+				if (!arg) {
+					ctx.ui.notify("Usage: /tf pause <runId>", "warning");
+					return;
+				}
+				const r = pauseRunById(ctx.cwd, arg);
+				ctx.ui.notify(r.message, r.ok ? "info" : "warning");
+				return;
+			}
+
+			if (sub === "delete") {
+				if (!arg) {
+					ctx.ui.notify("Usage: /tf delete <runId>", "warning");
+					return;
+				}
+				const r = deleteRunById(ctx.cwd, arg);
+				ctx.ui.notify(r.message, r.ok ? "info" : "warning");
+				return;
+			}
+
 			if (sub === "init") {
 				let settings: Record<string, unknown>;
 				try {
@@ -944,6 +982,58 @@ export default function (pi: ExtensionAPI) {
 }
 
 // --- helpers ---
+
+/**
+ * Pause a run. For a live detached run this sends SIGTERM to its process, which
+ * the detached runner catches to finish the in-flight phase and persist itself
+ * as "paused" (resumable). For an orphaned "running" run with no live process
+ * (e.g. the host crashed), it marks the run paused directly so it can resume.
+ */
+function pauseRunById(cwd: string, runId: string): { ok: boolean; message: string } {
+	const run = loadRun(cwd, runId);
+	if (!run) return { ok: false, message: `Run not found: ${runId}` };
+	if (run.status !== "running")
+		return { ok: false, message: `Run ${runId} is '${run.status}', not running — nothing to pause.` };
+
+	if (run.detached && run.pid && isProcessAlive(run.pid)) {
+		try {
+			process.kill(run.pid, "SIGTERM");
+			return {
+				ok: true,
+				message: `Pausing detached run ${runId} (pid ${run.pid}): it will finish the in-flight phase, then mark itself paused. Resume with /tf resume ${runId}.`,
+			};
+		} catch (e) {
+			return { ok: false, message: `Failed to signal pid ${run.pid}: ${e instanceof Error ? e.message : String(e)}` };
+		}
+	}
+
+	// No live process — orphaned "running" state. Mark paused directly.
+	run.status = "paused";
+	for (const p of Object.values(run.phases)) {
+		if (p.status === "running") {
+			p.status = "failed";
+			p.error = p.error ?? "interrupted (paused)";
+			p.endedAt = Date.now();
+		}
+	}
+	saveRun(run);
+	return { ok: true, message: `Run ${runId} had no live process; marked paused. Resume with /tf resume ${runId}.` };
+}
+
+/**
+ * Delete a run and its on-disk artifacts. Refuses to delete a live detached run
+ * (pause it first) to avoid orphaning a running background process.
+ */
+function deleteRunById(cwd: string, runId: string): { ok: boolean; message: string } {
+	const run = loadRun(cwd, runId);
+	if (!run) return { ok: false, message: `Run not found: ${runId}` };
+	if (run.status === "running" && run.detached && run.pid && isProcessAlive(run.pid))
+		return { ok: false, message: `Run ${runId} is still running (pid ${run.pid}). Pause it first with /tf pause ${runId}, then delete.` };
+	const { deleted } = deleteRun(cwd, runId);
+	return deleted
+		? { ok: true, message: `Deleted run ${runId}.` }
+		: { ok: false, message: `Nothing to delete for ${runId}.` };
+}
 
 /**
  * Register the Shared Context Tree tools inside a subagent process. These read
