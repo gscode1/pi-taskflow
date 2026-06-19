@@ -16,17 +16,28 @@ test("otel setup: disabled when OTEL_EXPORTER_OTLP_ENDPOINT is unset", () => {
 	}
 });
 
-test("otel setup: fail-open — env set but @opentelemetry packages absent → undefined, no throw", () => {
+test("otel setup: env set → never throws; returns undefined OR a valid session", async () => {
 	const prev = process.env[ENV_KEY];
 	process.env[ENV_KEY] = "http://localhost:4318";
-	// Silence the expected one-line warning so test output stays clean.
+	// Silence the warning emitted on the fail-open (packages-absent) path.
 	const origErr = console.error;
 	console.error = () => {};
 	try {
 		assert.equal(tracingEnabled(), true);
-		// The OTel SDK packages are NOT a dependency of this repo, so setup must
-		// degrade gracefully to undefined rather than crash the run.
-		assert.equal(startTracing(), undefined);
+		// The OTel SDK packages are optional and not declared deps of this repo.
+		// The contract is fail-OPEN: setup must never throw. The result is either
+		// `undefined` (packages not installed) or a usable { tracer, shutdown }
+		// session (packages present) — both are valid; assert the shape, not which.
+		const session = startTracing("pi-taskflow-test");
+		if (session !== undefined) {
+			assert.equal(typeof session.tracer.startSpan, "function");
+			assert.equal(typeof session.shutdown, "function");
+			// Exercising the seam must not throw, and shutdown must resolve.
+			const span = session.tracer.startSpan("setup.test.span");
+			span.setStatus({ ok: true });
+			span.end();
+			await session.shutdown();
+		}
 	} finally {
 		console.error = origErr;
 		if (prev === undefined) delete process.env[ENV_KEY];

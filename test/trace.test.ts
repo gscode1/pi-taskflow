@@ -115,6 +115,10 @@ test("trace: emits run → phase → subagent span hierarchy", async () => {
 	// Run-level attributes.
 	assert.equal(run.attributes["taskflow.name"], "trace-flow");
 	assert.equal(run.attributes["taskflow.run_id"], "trace-1");
+
+	// EVERY span carries the run id so any span is filterable by run without
+	// having to walk up to the root span.
+	assert.ok(spans.every((s) => s.attributes["taskflow.run_id"] === "trace-1"), "every span must carry taskflow.run_id");
 	assert.equal(run.attributes["taskflow.phase_count"], 2);
 	assert.equal(run.attributes["taskflow.status"], "completed");
 	assert.equal(run.status?.ok, true);
@@ -126,6 +130,57 @@ test("trace: emits run → phase → subagent span hierarchy", async () => {
 	assert.equal(phaseA.attributes["gen_ai.usage.input_tokens"], 10);
 	assert.equal(phaseA.attributes["taskflow.usage.cost_usd"], 0.01);
 	assert.equal(phaseA.attributes["cache.hit"], false);
+});
+
+test("trace: skipped phase emits a span with skip reason + topology", async () => {
+	const def = {
+		name: "trace-skip",
+		phases: [
+			{ id: "a", type: "agent", task: "do a" },
+			// `when: false` → never runs; b should be skipped and still get a span.
+			{ id: "b", type: "agent", task: "do b", dependsOn: ["a"], when: "false", agent: "default", optional: true },
+		],
+	};
+	const state = mkState(def, "trace-skip-1");
+	const { tracer, spans } = recordingTracer();
+	const deps: RuntimeDeps = { cwd: "/tmp", agents: [dummyAgent], tracer, runTask: async (_c, _a, _n, t) => mockRunResult(t) };
+
+	await executeTaskflow(state, deps);
+
+	const phaseSpans = spans.filter((s) => s.name === SPAN.phase);
+	const skipped = phaseSpans.find((p) => p.attributes["phase.id"] === "b");
+	assert.ok(skipped, "skipped phase must still emit a span");
+	assert.equal(skipped.attributes["phase.status"], "skipped");
+	assert.ok(String(skipped.attributes["phase.skip_reason"]).includes("Condition not met"));
+	// Static topology is attached even on skip.
+	assert.equal(skipped.attributes["phase.agent"], "default");
+	assert.equal(skipped.attributes["phase.optional"], true);
+	assert.equal(skipped.attributes["phase.depends_on"], "a");
+	assert.equal(skipped.attributes["phase.has_when"], true);
+
+	// Run-level rollups reflect the skip.
+	const run = spans.find((s) => s.name === SPAN.run);
+	assert.equal(run?.attributes["taskflow.phases_done"], 1);
+	assert.equal(run?.attributes["taskflow.phases_skipped"], 1);
+});
+
+test("trace: subagent span carries exit code + timeout flags", async () => {
+	const def = { name: "trace-sub", phases: [{ id: "a", type: "agent", task: "hi" }] };
+	const state = mkState(def, "trace-sub-1");
+	const { tracer, spans } = recordingTracer();
+	const deps: RuntimeDeps = {
+		cwd: "/tmp",
+		agents: [dummyAgent],
+		tracer,
+		runTask: async () => ({ agent: "default", task: "", exitCode: 0, output: "ok", stderr: "", usage: emptyUsage(), model: "test/model", stopReason: "end_turn" }),
+	};
+	await executeTaskflow(state, deps);
+	const sub = spans.find((s) => s.name === SPAN.subagent);
+	assert.ok(sub);
+	assert.equal(sub.attributes["subagent.exit_code"], 0);
+	assert.equal(sub.attributes["subagent.stop_reason"], "end_turn");
+	assert.equal(sub.attributes["subagent.timeout"], false);
+	assert.equal(sub.attributes["gen_ai.response.model"], "test/model");
 });
 
 test("trace: failed phase marks span status not-ok", async () => {
