@@ -56,11 +56,20 @@ try {
 	// their own process, so we MUST flush spans before exiting or they're lost.
 	const tracing = startTracing();
 
+	// Graceful pause: a `/tf pause <runId>` sends SIGTERM to this process. Abort
+	// the run signal so the runtime finishes the in-flight phase, marks the run
+	// "paused" (resumable), and persists — instead of dying mid-phase as "running".
+	const controller = new AbortController();
+	const onPauseSignal = () => controller.abort();
+	process.on("SIGTERM", onPauseSignal);
+	process.on("SIGINT", onPauseSignal);
+
 	try {
 		const result = await executeTaskflow(state, {
 			cwd: ctx.cwd,
 			agents,
 			globalThinking: settings.globalThinking,
+			signal: controller.signal,
 			persist: (s) => saveRun(s, cleanupConfig),
 			// No requestApproval — approval phases auto-reject in detached/CI mode
 			// (safety: approval gates are never bypassed; the run records the rejection).
@@ -70,6 +79,8 @@ try {
 
 		saveRun(result.state, cleanupConfig);
 	} finally {
+		process.off("SIGTERM", onPauseSignal);
+		process.off("SIGINT", onPauseSignal);
 		await tracing?.shutdown();
 	}
 } catch (e) {

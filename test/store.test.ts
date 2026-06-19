@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { test } from "node:test";
 import type { Taskflow } from "../extensions/schema.ts";
 import {
+	deleteRun,
 	getFlow,
 	hashInput,
 	listFlows,
@@ -453,6 +454,36 @@ test("saveRun: successive saves overwrite the same run file", () => {
 		const flowDir = path.join(runsDir, "test-flow");
 		const files = fs.readdirSync(flowDir).filter((f) => f.includes("overwrite-me"));
 		assert.equal(files.length, 1);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("deleteRun: removes the run file and its index entry", () => {
+	const cwd = makeTmpCwd();
+	try {
+		const state = mkRunState(cwd, { runId: "delete-me", status: "completed" });
+		saveRun(state);
+		assert.ok(loadRun(cwd, "delete-me"), "run should exist before delete");
+
+		const { deleted } = deleteRun(cwd, "delete-me");
+		assert.equal(deleted, true);
+		assert.equal(loadRun(cwd, "delete-me"), null, "run gone after delete");
+		assert.ok(!listRuns(cwd).some((r) => r.runId === "delete-me"), "not listed after delete");
+
+		// The on-disk file is gone too.
+		const flowDir = path.join(cwd, ".pi", "taskflows", "runs", "test-flow");
+		const remaining = fs.existsSync(flowDir) ? fs.readdirSync(flowDir).filter((f) => f.includes("delete-me")) : [];
+		assert.equal(remaining.length, 0);
+	} finally {
+		cleanup(cwd);
+	}
+});
+
+test("deleteRun: returns deleted=false for a nonexistent run", () => {
+	const cwd = makeTmpCwd();
+	try {
+		assert.equal(deleteRun(cwd, "never-existed").deleted, false);
 	} finally {
 		cleanup(cwd);
 	}
