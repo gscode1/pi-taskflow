@@ -390,7 +390,12 @@ test("runtime: gate PASS lets the flow continue", async () => {
 	assert.equal(res.state.phases.ship.status, "done");
 });
 
-test("runtime: agy gates do not get stdout idle watchdog", async () => {
+test("runtime: gate passes the gate idle default through (agy exemption is the runner's job)", async () => {
+	// The agy idle-watchdog exemption lives in the runner, where the EFFECTIVE
+	// provider (phase.provider ?? agent.provider, incl. providerRoles) is resolved.
+	// Runtime must NOT special-case phase.provider — for agy gates it is usually
+	// unset and the agy provider comes from the agent/role. So runtime always hands
+	// the runner the standard gate idle default and lets the runner decide.
 	const def: Taskflow = {
 		name: "agy-gate",
 		phases: [
@@ -412,8 +417,7 @@ test("runtime: agy gates do not get stdout idle watchdog", async () => {
 	};
 	const res = await executeTaskflow(mkState(def), baseDeps(runTask));
 	assert.equal(res.ok, true);
-	assert.equal(opts?.provider, "agy");
-	assert.equal(opts?.idleTimeoutMs, 0);
+	assert.equal(opts?.idleTimeoutMs, 2 * 60_000, "runtime passes the standard gate idle default");
 });
 
 test("runtime: gate wall-clock timeout under explicit retry policy stops after one attempt", async () => {

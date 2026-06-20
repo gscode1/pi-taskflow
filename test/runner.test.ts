@@ -411,6 +411,47 @@ test("runAgentTask: idle watchdog kills a silent (stalled) subagent", async () =
 	}
 });
 
+test("runAgentTask: agy provider (from agent def) is exempt from the idle watchdog", async () => {
+	// Regression for run dev-issue-to-pr-mqm7gru3 (plan-gate). The plan-gate phase
+	// sets no provider, so its agent (reviewer → providerRole) resolves to `agy`.
+	// agy buffers output and emits nothing incrementally, so the idle watchdog
+	// false-killed a healthy reasoning gate after 120s. The runner must zero the
+	// idle timeout when the EFFECTIVE provider (here from agent.provider, not the
+	// phase/opts) is agy. We shim the `agy` command on PATH with a binary that
+	// stays silent past the idle window, then exits cleanly.
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tf-agy-idle-"));
+	const fakeAgy = path.join(dir, "agy");
+	// Silent for 600ms (well past the 200ms idle below), then print + exit 0.
+	fs.writeFileSync(
+		fakeAgy,
+		`#!/bin/sh\nsleep 0.6\necho "agy done"\nexit 0\n`,
+	);
+	fs.chmodSync(fakeAgy, 0o755);
+
+	const agents: AgentConfig[] = [
+		{ name: "rev", description: "d", systemPrompt: "", source: "user", filePath: "", provider: "agy" },
+	];
+
+	const prevPath = process.env.PATH;
+	process.env.PATH = `${dir}:${prevPath ?? ""}`;
+	try {
+		const start = Date.now();
+		// A tight idle timeout that WOULD trip on a 600ms silent run — but agy must
+		// override it to 0, so the run completes instead of being killed.
+		const res = await runAgentTask(dir, agents, "rev", "review the plan", {
+			idleTimeoutMs: 200,
+		});
+		const elapsed = Date.now() - start;
+		assert.ok(elapsed >= 500, `agy run should not be idle-killed early, took ${elapsed}ms`);
+		assert.notEqual(res.idleTimeout, true, "agy must not be flagged as idle-timed-out");
+		assert.equal(res.exitCode, 0, `agy run should exit cleanly, got ${res.exitCode}: ${res.stderr}`);
+	} finally {
+		if (prevPath === undefined) delete process.env.PATH;
+		else process.env.PATH = prevPath;
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("runAgentTask: hard timeout kills a chatty subagent", async () => {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tf-hard-timeout-"));
 	const fakePi = path.join(dir, "fake-pi.mjs");

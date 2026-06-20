@@ -450,7 +450,16 @@ export async function runAgentTask(
 			piArgs: effectiveProvider === "pi" ? args : undefined,
 			systemPromptFile: effectiveProvider === "agy" ? tmpPromptPath ?? undefined : undefined,
 			model,
-			idleTimeoutMs: opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
+			// The idle watchdog kills a child that emits no stdout for N ms (the timer
+			// resets on each stdout chunk). The `agy` provider buffers its run and
+			// emits output only at completion, so a healthy multi-minute agy reasoning
+			// gate produces no incremental stdout and looks "stalled" — exactly the
+			// false kill seen on plan-gate. The effective provider is only resolved
+			// here (opts.provider ?? agent.provider, possibly via a providerRole),
+			// which is why this must live in the runner and not in runtime.ts, where
+			// only phase.provider — usually unset for agy agents — is visible. Disable
+			// the idle watchdog for agy; the wall-clock timeout still bounds a wedged run.
+			idleTimeoutMs: effectiveProvider === "agy" ? 0 : (opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS),
 			signal: timeoutController.signal,
 			env: { ...process.env, ...ctxEnv },
 			onStdout: (chunk) => {

@@ -757,7 +757,11 @@ async function executePhaseInner(
 					thinking: phase.thinking,
 					tools: phase.tools,
 					timeoutMs: phase.timeoutMs ?? gateDefaults.timeoutMs,
-					idleTimeoutMs: phase.provider === "agy" ? 0 : gateDefaults.idleTimeoutMs,
+					// NB: agy runs disable the idle watchdog inside the runner, where the
+					// *effective* provider (phase.provider ?? agent.provider, incl. roles)
+					// is resolved. Don't special-case provider here — phase.provider is
+					// usually unset and the agy provider comes from the agent/role.
+					idleTimeoutMs: gateDefaults.idleTimeoutMs,
 					cwd: effCwd,
 					signal: deps.signal,
 					onLive,
