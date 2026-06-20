@@ -714,11 +714,15 @@ async function executePhaseInner(
 	};
 
 	// Gate phases converge fast on well-formed evidence (the dev-issue-to-pr gate
-	// normally finishes in 6–13 turns / under 3 min). The global 10-min wall-clock
-	// / 5-min idle defaults let a stuck reviewer stream for the full window before
-	// dying; a tighter gate budget makes such a stall fail fast instead of burning
-	// ~30 min × $0.38 across retries. Explicit phase timeoutMs still wins.
-	const GATE_DEFAULT_TIMEOUT_MS = 5 * 60_000;
+	// normally finishes in 6–13 turns / under 3 min). Stall detection is the job of
+	// the IDLE timeout: a genuinely stuck reviewer produces no output for 2 min and
+	// is killed fast, without burning ~30 min × $0.38 across retries. The WALL-CLOCK
+	// timeout only bounds a gate that is legitimately thinking and streaming — e.g. a
+	// `thinking:high` reviewer over a large plan/diff — so it must be generous enough
+	// not to kill the normal case. A 5-min wall-clock was too tight (it killed a
+	// real plan-gate mid-think); 15 min covers slow reasoning gates while the 2-min
+	// idle still trips quickly on an actual hang. Explicit phase timeoutMs still wins.
+	const GATE_DEFAULT_TIMEOUT_MS = 15 * 60_000;
 	const GATE_DEFAULT_IDLE_TIMEOUT_MS = 2 * 60_000;
 	const gateDefaults =
 		type === "gate"

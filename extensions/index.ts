@@ -163,6 +163,19 @@ function makeRunState(def: Taskflow, args: Record<string, unknown>, cwd: string)
 	};
 }
 
+/**
+ * Decide whether the live-update stream runs in QUIET mode (emit only on phase
+ * transitions) or streams every heartbeat frame. See the call site for why this
+ * matters (headless transcript bloat). Pure for testability.
+ *   env "1" → always quiet;  env "0" → always live;
+ *   env unset → quiet when headless (no interactive UI), live when a human is watching.
+ */
+export function resolveQuiet(envValue: string | undefined, hasUI: boolean): boolean {
+	if (envValue === "1") return true;
+	if (envValue === "0") return false;
+	return !hasUI;
+}
+
 async function runFlow(
 	def: Taskflow,
 	args: Record<string, unknown>,
@@ -194,11 +207,38 @@ async function runFlow(
 	// ~8fps heartbeat drives all rendering: it naturally caps the frame rate
 	// (no event bursts) while keeping the spinner, elapsed timers, live tokens
 	// and the latest message current. Phase events only mutate `state`.
+	//
+	// QUIET MODE (default on; the bloat fix): each emit carries the full run `state`
+	// in `details`. A headless/scheduled caller (e.g. pi-tick) records every
+	// onUpdate, so streaming ~8 full-state frames/sec for a long run balloons the
+	// captured transcript into the hundreds of MB (a 1027s run ≈ 8.5k frames). In
+	// quiet mode we still drive `onUpdate`, but only when a phase transitions
+	// (started/done/failed) — collapsing thousands of redundant frames to roughly
+	// one per phase. The full detail always persists to the run dir via saveRun;
+	// quiet only trims the live stream, and the unconditional terminal emit in
+	// `finally` still delivers the final state.
+	//   PI_TASKFLOW_QUIET=1 → always quiet;  =0 → always stream live frames.
+	//   unset → quiet when headless (no interactive UI), live when a human is
+	//   watching the TUI (where live elapsed timers / token counters matter and the
+	//   in-place render doesn't accumulate). This makes quiet the default for the
+	//   scheduled runs that actually bloat, without degrading interactive use.
+	const quiet = resolveQuiet(process.env.PI_TASKFLOW_QUIET, ctx.hasUI);
+	const phaseSig = (s: RunState) =>
+		Object.entries(s.phases)
+			.map(([id, p]) => `${id}:${p.status}`)
+			.join("|");
+	let lastSig = "";
 	let heartbeat: ReturnType<typeof setInterval> | undefined;
 	let tracing: TracingSession | undefined;
 	if (onUpdate) {
 		heartbeat = setInterval(() => {
-			if (state.status === "running") emit(state);
+			if (state.status !== "running") return;
+			if (quiet) {
+				const sig = phaseSig(state);
+				if (sig === lastSig) return;
+				lastSig = sig;
+			}
+			emit(state);
 		}, 120);
 		(heartbeat as { unref?: () => void }).unref?.();
 	}
