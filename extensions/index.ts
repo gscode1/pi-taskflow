@@ -341,6 +341,7 @@ async function runFlow(
 			requestApproval,
 			loadFlow: (name: string) => getFlow(ctx.cwd, name)?.def,
 			tracer: tracing?.tracer,
+			meter: tracing?.meter,
 		});
 		return result;
 	} finally {

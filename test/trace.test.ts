@@ -94,14 +94,20 @@ test("trace: emits run → phase → subagent span hierarchy", async () => {
 	const result = await executeTaskflow(state, deps);
 	assert.equal(result.ok, true);
 
-	const runSpans = spans.filter((s) => s.name === SPAN.run);
-	const phaseSpans = spans.filter((s) => s.name === SPAN.phase);
-	const subSpans = spans.filter((s) => s.name === SPAN.subagent);
+	const runSpans = spans.filter((s) => s.attributes["taskflow.span_kind"] === SPAN.run);
+	const phaseSpans = spans.filter((s) => s.attributes["taskflow.span_kind"] === SPAN.phase);
+	const subSpans = spans.filter((s) => s.attributes["taskflow.span_kind"] === SPAN.subagent);
 
 	// One run span, two phase spans, two subagent spans.
 	assert.equal(runSpans.length, 1);
 	assert.equal(phaseSpans.length, 2);
 	assert.equal(subSpans.length, 2);
+
+	// Span NAMES are descriptive (not the shared constant) so trace UIs that label
+	// by operation name render a readable, per-phase/per-agent hierarchy.
+	assert.equal(runSpans[0].name, "taskflow.run trace-flow");
+	assert.ok(phaseSpans.some((p) => p.name === "phase:agent a"), "phase span named by type + id");
+	assert.ok(subSpans.some((s) => s.name === "subagent default"), "subagent span named by agent");
 
 	// All spans ended.
 	assert.ok(spans.every((s) => s.ended), "every span must be ended");
@@ -147,7 +153,7 @@ test("trace: skipped phase emits a span with skip reason + topology", async () =
 
 	await executeTaskflow(state, deps);
 
-	const phaseSpans = spans.filter((s) => s.name === SPAN.phase);
+	const phaseSpans = spans.filter((s) => s.attributes["taskflow.span_kind"] === SPAN.phase);
 	const skipped = phaseSpans.find((p) => p.attributes["phase.id"] === "b");
 	assert.ok(skipped, "skipped phase must still emit a span");
 	assert.equal(skipped.attributes["phase.status"], "skipped");
@@ -159,7 +165,7 @@ test("trace: skipped phase emits a span with skip reason + topology", async () =
 	assert.equal(skipped.attributes["phase.has_when"], true);
 
 	// Run-level rollups reflect the skip.
-	const run = spans.find((s) => s.name === SPAN.run);
+	const run = spans.find((s) => s.attributes["taskflow.span_kind"] === SPAN.run);
 	assert.equal(run?.attributes["taskflow.phases_done"], 1);
 	assert.equal(run?.attributes["taskflow.phases_skipped"], 1);
 });
@@ -175,7 +181,7 @@ test("trace: subagent span carries exit code + timeout flags", async () => {
 		runTask: async () => ({ agent: "default", task: "", exitCode: 0, output: "ok", stderr: "", usage: emptyUsage(), model: "test/model", stopReason: "end_turn" }),
 	};
 	await executeTaskflow(state, deps);
-	const sub = spans.find((s) => s.name === SPAN.subagent);
+	const sub = spans.find((s) => s.attributes["taskflow.span_kind"] === SPAN.subagent);
 	assert.ok(sub);
 	assert.equal(sub.attributes["subagent.exit_code"], 0);
 	assert.equal(sub.attributes["subagent.stop_reason"], "end_turn");
@@ -197,8 +203,8 @@ test("trace: failed phase marks span status not-ok", async () => {
 	const result = await executeTaskflow(state, deps);
 	assert.equal(result.ok, false);
 
-	const run = spans.find((s) => s.name === SPAN.run);
-	const phase = spans.find((s) => s.name === SPAN.phase);
+	const run = spans.find((s) => s.attributes["taskflow.span_kind"] === SPAN.run);
+	const phase = spans.find((s) => s.attributes["taskflow.span_kind"] === SPAN.phase);
 	assert.equal(run?.status?.ok, false);
 	assert.equal(phase?.status?.ok, false);
 	assert.equal(phase?.attributes["phase.status"], "failed");

@@ -41,7 +41,7 @@ pi install npm:pi-taskflow
 | **Per-phase subagent timeouts (`timeoutMs`)** | A new `timeoutMs` field on each phase and on `RunOptions`. A subagent that exceeds the wall-clock cap (default 10 minutes; `0` disables) is killed and the phase is marked failed with a new `RunResult.timeout` flag. The transient-retry heuristic now treats timeouts (and idle timeouts) as deterministic stalls — they don't get auto-retried. | `extensions/runner.ts` (`runAgentProcess`, `DEFAULT_TIMEOUT_MS`); `extensions/schema.ts` (`timeoutMs` on `PhaseSchema`); `test/runner.test.ts` |
 | **Pluggable CLI providers (`provider: "pi" \| "agy"`)** | A new optional `provider` field on phases and agent configs, plus a `providerRoles` setting (mirror of `modelRoles`) so a single agent can be wired to different CLI runners per role. The `pi-agent-runner` package (file dep, `../pi-agent-runner`) abstracts the spawn layer; the new `agy` provider shows how to plug in an alternative runner. | `extensions/agents.ts` (`AgentConfig.provider`, `providerRoles`); `extensions/schema.ts` (`provider` on `PhaseSchema`); `extensions/runner.ts` (`runAgentProcess`, `AgentProvider`); `test/agents.test.ts` |
 | **`exec` phase — deterministic shell steps** | A new `exec` phase type that runs a shell `cmd` via `bash -c` with **no LLM/subagent** — stdout (trimmed) becomes the phase output, exit code maps to status (0=done, non-zero=failed), and it honors `output: "json"`, `timeoutMs`, and the run abort signal (usage is zero). Lets a flow interleave cheap, reproducible glue steps (git, jq, file ops) between agent phases without burning tokens. Security: `exec` is rejected in dynamic/LLM-generated sub-flows — only author-written flows may use it (mirrors the workspace-keyword guard). | `extensions/schema.ts` (`exec` in `PHASE_TYPES`, `cmd` field, dynamic-flow guard); `extensions/runtime.ts` (exec branch); `test/exec.test.ts` |
-| **OpenTelemetry traces for flows** | An opt-in, **zero-dependency** tracing seam. The runtime emits a `taskflow.run` → `taskflow.phase` → `taskflow.subagent` span hierarchy through a vendor-neutral `Tracer` that defaults to a no-op. Enable for live `/tf` runs by setting `OTEL_EXPORTER_OTLP_ENDPOINT` (and installing the OTel SDK packages); foreground and detached runs both export and flush automatically. Unset = zero overhead. Spans carry rich, **content-free** diagnostics — GenAI-convention usage (tokens/model/cost), attempts, `cache.hit`, phase topology (`agent`/`depends_on`/`optional`/`cwd`/`timeout`), type-specific outcomes (gate/approval/loop/tournament/fan-out), subagent failure detail (`exit_code`/`stop_reason`/`timeout`), **skipped-phase spans with `skip_reason`**, and `taskflow.run_id` + `taskflow.name` on *every* span for run correlation. The OTel packages are never repo dependencies — only the lazy adapter/bootstrap touch them. | `extensions/trace.ts`; `extensions/otel/adapter.ts`; `extensions/otel/setup.ts`; `extensions/runtime.ts`; `extensions/index.ts`, `extensions/detached-runner.ts` (activation); `test/trace.test.ts`, `test/otel-setup.test.ts` |
+| **OpenTelemetry traces + metrics for flows** | An opt-in, **zero-dependency** observability seam. The runtime emits a run → phase → subagent span hierarchy through vendor-neutral `Tracer` and `Meter` interfaces that both default to a no-op. Enable for live `/tf` runs by setting `OTEL_EXPORTER_OTLP_ENDPOINT` (and installing the OTel SDK packages); foreground and detached runs both export and flush automatically. Unset = zero overhead. **Span names are descriptive** (`taskflow.run <flow>`, `phase:<type> <id>`, `subagent <agent>`) so trace UIs render a readable per-phase/per-agent hierarchy, with a stable `taskflow.span_kind` attribute for aggregation; subagent spans are `SpanKind.CLIENT` and carry GenAI-convention attrs (`gen_ai.operation.name`/`agent.name`/`request.model`/usage). Spans also carry **content-free** diagnostics — attempts, `cache.hit`, phase topology, type-specific outcomes (gate/approval/loop/tournament/fan-out), subagent failure detail, **skipped-phase spans with `skip_reason`**, **`retry`/`loop.iteration` span events**, and `taskflow.run_id` + `taskflow.name` on *every* span. **Metrics push over OTLP** (same endpoint, via a `PeriodicExportingMetricReader`): run/phase/subagent **duration** + **cost (USD)**, **token throughput**, **retry** and **cache hit/miss** counters, all dimensioned by flow/phase-type/status/agent/model. **Resource attributes** (`service.version`, `deployment.environment.name`, `taskflow.flow_version`) let you slice by deploy. The OTel packages are never repo dependencies — only the lazy adapters/bootstrap touch them. See **[Observability setup](#observability-opentelemetry)** below. | `extensions/trace.ts`, `extensions/metrics.ts`; `extensions/otel/adapter.ts`, `extensions/otel/metrics-adapter.ts`, `extensions/otel/setup.ts`; `extensions/runtime.ts`; `extensions/index.ts`, `extensions/detached-runner.ts` (activation); `test/trace.test.ts`, `test/metrics.test.ts`, `test/otel-setup.test.ts` |
 | **Run lifecycle: `/tf pause` + `/tf delete`** | Completes the run-lifecycle command set alongside the existing `/tf resume`. `/tf pause <id>` (tool action `pause`) gracefully pauses a running run — for a live detached run it `SIGTERM`s the process, which the detached runner catches to finish the in-flight phase and persist as `paused` (resumable); an orphaned `running` run is marked paused directly. `/tf delete <id>` (tool action `delete`) removes a run's state file, lock, index entry, and per-run context-tree + workspace dirs (refuses to delete a live detached run). Detached/background runs are now also tagged with a `⤳bg` marker + pid in `/tf runs`. | `extensions/store.ts` (`deleteRun`); `extensions/detached-runner.ts` (SIGTERM→abort); `extensions/index.ts` (`pause`/`delete` actions + `/tf` subcommands); `extensions/runs-view.ts` (background tag); `test/store.test.ts`, `test/runs-view.test.ts` |
 
 **Upstream tracking:** watch [`heggria/pi-taskflow`](https://github.com/heggria/pi-taskflow) for upstream releases. To re-sync, merge `upstream/main` into this branch; the changes above are isolated to small, well-marked surfaces and rebase cleanly.
@@ -583,6 +583,59 @@ Agent discovery scope (via `agentScope` in the flow definition):
 | `"both"` | user + project; project wins on name collision |
 
 Run cleanup is configurable via `maxKeptRuns` and `maxRunAgeDays` in settings.
+
+## Observability (OpenTelemetry)
+
+Tracing and metrics are **opt-in and zero-dependency**. The core runtime emits telemetry through vendor-neutral `Tracer`/`Meter` seams that default to a no-op, so an unconfigured run pays nothing and the OTel packages are never repo dependencies — only the lazy adapters touch them.
+
+**Enable it** by setting the standard OTel endpoint and installing the SDK packages. Activation is automatic for both foreground and detached `/tf` runs (spans/metrics are flushed on exit):
+
+```bash
+# Traces
+npm install @opentelemetry/api \
+            @opentelemetry/sdk-trace-node \
+            @opentelemetry/exporter-trace-otlp-http \
+            @opentelemetry/resources \
+            @opentelemetry/semantic-conventions
+# Metrics (optional — traces work without these; metrics degrade to off)
+npm install @opentelemetry/sdk-metrics \
+            @opentelemetry/exporter-metrics-otlp-http
+
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318   # turns telemetry ON
+```
+
+**Environment variables**
+
+| Variable | Effect |
+| --- | --- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | **Master switch.** Unset = zero overhead. Set = export traces (+ metrics if installed). All standard `OTEL_EXPORTER_OTLP_*` vars are honored by the exporters. |
+| `OTEL_SERVICE_VERSION` *(or `npm_package_version`)* | Sets the `service.version` resource attribute. |
+| `DEPLOYMENT_ENVIRONMENT` *(or `NODE_ENV`)* | Sets the `deployment.environment.name` resource attribute. |
+
+**What you get**
+
+- **Traces** — a `taskflow.run <flow>` → `phase:<type> <id>` → `subagent <agent>` hierarchy. Names are descriptive so trace UIs (Jaeger/Tempo) render a readable per-phase/per-agent timeline; a stable `taskflow.span_kind` attribute lets dashboards still aggregate across all phase/subagent/run spans. Subagent spans are `SpanKind.CLIENT` with GenAI-convention attributes. Retries and loop passes appear as `retry` / `loop.iteration` **span events**; skipped phases get their own span with `skip_reason`.
+- **Metrics** (pushed over OTLP via a `PeriodicExportingMetricReader`) — run/phase/subagent **duration**, **cost (USD)**, **token throughput**, plus **retry** and **cache hit/miss** counters, dimensioned by flow / phase-type / status / agent / model.
+
+**Metrics backend: push to a Collector, then choose.** Metrics are **pushed** over OTLP (the right model for short-lived flow runs — a Prometheus scrape can miss a process that finishes between scrapes). Point the endpoint at an [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) and let *it* decide the final store. To land metrics in Prometheus, enable the Collector's `prometheus` exporter (scrape) or `prometheusremotewrite` exporter — no code changes:
+
+```yaml
+# otel-collector-config.yaml (sketch)
+receivers:
+  otlp:
+    protocols: { http: {}, grpc: {} }
+exporters:
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+  # or expose a /metrics endpoint for Prometheus to scrape:
+  # prometheus: { endpoint: "0.0.0.0:9464" }
+service:
+  pipelines:
+    traces:  { receivers: [otlp], exporters: [otlp/jaeger] }
+    metrics: { receivers: [otlp], exporters: [prometheusremotewrite] }
+```
+
+Everything is **fail-open**: a missing endpoint, missing packages, or a setup error logs a single warning and the flow runs untraced — observability never fails a run.
 
 ## Agents
 

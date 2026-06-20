@@ -21,13 +21,39 @@
 
 import { createRequire } from "node:module";
 import { otelTracer } from "./adapter.ts";
+import { otelMeter } from "./metrics-adapter.ts";
 import type { Tracer } from "../trace.ts";
+import type { Meter } from "../metrics.ts";
 
-/** A live tracing session: the tracer to inject, plus a flush/shutdown hook. */
+/** A live telemetry session: tracer + meter to inject, plus a flush/shutdown hook. */
 export interface TracingSession {
 	tracer: Tracer;
-	/** Flush pending spans and shut down the exporter. Always safe to await. */
+	/** Optional metrics meter, present when the metrics SDK is installed. */
+	meter?: Meter;
+	/** Flush pending spans/metrics and shut down the exporters. Always safe to await. */
 	shutdown: () => Promise<void>;
+}
+
+/**
+ * Resource attributes describing THIS process — attached to every span/metric so
+ * you can slice telemetry by service version and deployment environment. Read
+ * from standard env vars with sensible fallbacks; degrades to service.name only
+ * if the resources/semconv packages aren't installed.
+ */
+function buildResource(require: NodeRequire, serviceName: string): unknown {
+	try {
+		const { resourceFromAttributes } = require("@opentelemetry/resources");
+		const sc = require("@opentelemetry/semantic-conventions");
+		const attrs: Record<string, string> = { [sc.ATTR_SERVICE_NAME]: serviceName };
+		const version = process.env.OTEL_SERVICE_VERSION ?? process.env.npm_package_version;
+		if (version) attrs[sc.ATTR_SERVICE_VERSION ?? "service.version"] = version;
+		const env = process.env.DEPLOYMENT_ENVIRONMENT ?? process.env.NODE_ENV;
+		// `deployment.environment.name` is the current stable semconv key.
+		if (env) attrs["deployment.environment.name"] = env;
+		return resourceFromAttributes(attrs);
+	} catch {
+		return undefined;
+	}
 }
 
 /** True when the user has opted into tracing via the standard OTel env var. */
@@ -48,30 +74,48 @@ export function startTracing(serviceName = "pi-taskflow"): TracingSession | unde
 		const { OTLPTraceExporter } = require("@opentelemetry/exporter-trace-otlp-http");
 
 		// Optional resource attributes — degrade gracefully if the packages aren't present.
-		let resource: unknown;
-		try {
-			const { resourceFromAttributes } = require("@opentelemetry/resources");
-			const { ATTR_SERVICE_NAME } = require("@opentelemetry/semantic-conventions");
-			resource = resourceFromAttributes({ [ATTR_SERVICE_NAME]: serviceName });
-		} catch {
-			resource = undefined;
-		}
+		const resource = buildResource(require, serviceName);
 
 		const exporter = new OTLPTraceExporter(); // reads OTEL_EXPORTER_OTLP_* env vars
 		const provider = new BasicTracerProvider({
 			...(resource ? { resource } : {}),
 			spanProcessors: [new BatchSpanProcessor(exporter)],
 		});
-
 		const tracer = otelTracer(provider.getTracer(serviceName));
+
+		// Metrics pipeline (OTLP push). Optional & independent: if the metrics SDK
+		// or exporter isn't installed, we run with traces only — never fail.
+		let meter: Meter | undefined;
+		let meterProvider: { forceFlush: () => Promise<void>; shutdown: () => Promise<void> } | undefined;
+		try {
+			const { MeterProvider, PeriodicExportingMetricReader } = require("@opentelemetry/sdk-metrics");
+			const { OTLPMetricExporter } = require("@opentelemetry/exporter-metrics-otlp-http");
+			const mp = new MeterProvider({
+				...(resource ? { resource } : {}),
+				// Push to the collector on an interval (and once more on shutdown).
+				readers: [new PeriodicExportingMetricReader({ exporter: new OTLPMetricExporter() })],
+			});
+			meterProvider = mp;
+			meter = otelMeter(mp.getMeter(serviceName));
+		} catch {
+			meter = undefined; // traces-only; metrics packages not installed
+		}
+
 		return {
 			tracer,
+			meter,
 			shutdown: async () => {
 				try {
 					await provider.forceFlush();
 					await provider.shutdown();
 				} catch {
 					// best-effort flush — never block run teardown on the exporter
+				}
+				try {
+					await meterProvider?.forceFlush();
+					await meterProvider?.shutdown();
+				} catch {
+					// best-effort flush — metrics must never block teardown either
 				}
 			},
 		};
