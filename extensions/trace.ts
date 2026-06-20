@@ -17,6 +17,13 @@
 /** Primitive attribute values accepted on a span (mirrors OTel `AttributeValue`). */
 export type SpanAttributeValue = string | number | boolean;
 
+/**
+ * Span kind — structural subset of OTel `SpanKind`. The runtime marks subagent
+ * spans (the actual outbound LLM/process calls) as CLIENT so they're visually
+ * distinct from the INTERNAL orchestration spans (run/phase) in trace UIs.
+ */
+export type SpanKind = "internal" | "client";
+
 /** A single span. Structural subset of the OpenTelemetry `Span`. */
 export interface SpanLike {
 	/** Attach key/value attributes. Undefined values are ignored by convention. */
@@ -33,7 +40,7 @@ export interface SpanLike {
 export interface Tracer {
 	startSpan(
 		name: string,
-		opts?: { startTime?: number; parent?: SpanLike; attributes?: Record<string, SpanAttributeValue | undefined> },
+		opts?: { startTime?: number; parent?: SpanLike; kind?: SpanKind; attributes?: Record<string, SpanAttributeValue | undefined> },
 	): SpanLike;
 }
 
@@ -50,9 +57,31 @@ export const NOOP_TRACER: Tracer = {
 	startSpan: () => NOOP_SPAN,
 };
 
-/** Span name constants — kept here so the adapter and tests agree on them. */
+/**
+ * Stable, low-cardinality span "kind" identifiers. These are NOT the span names
+ * anymore (those are descriptive — see `spanName` below) but live on every span
+ * as the `taskflow.span_kind` attribute, so dashboards can aggregate across all
+ * phase/subagent/run spans regardless of their human-readable name.
+ */
 export const SPAN = {
 	run: "taskflow.run",
 	phase: "taskflow.phase",
 	subagent: "taskflow.subagent",
+} as const;
+
+/**
+ * Descriptive span names. Trace UIs (Jaeger, Tempo, etc.) label and group spans
+ * by their operation NAME, so a single shared constant renders every span as the
+ * same opaque row ("taskflow.phase"). These builders fold the most useful
+ * identifier into the name — the phase id, the agent, the flow — keeping the name
+ * low-cardinality (ids/agents/flows are bounded per flow) while making a trace
+ * readable at a glance. The stable `SPAN.*` value still rides along as the
+ * `taskflow.span_kind` attribute for aggregation.
+ */
+export const spanName = {
+	run: (flow: string) => `taskflow.run ${flow}`,
+	/** e.g. `phase:gate review` or `phase:agent build` — type prefix + phase id. */
+	phase: (type: string, id: string) => `phase:${type} ${id}`,
+	/** e.g. `subagent coder` — the agent doing the work. */
+	subagent: (agent: string) => `subagent ${agent}`,
 } as const;

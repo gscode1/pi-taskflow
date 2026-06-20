@@ -23,7 +23,8 @@ import { hashInput, newRunId, type PhaseState, type RunState, runsDir } from "./
 import { CacheStore, resolveFingerprint } from "./cache.ts";
 import { ctxDirFor, drainPendingSpawns, initCtxDir, registerNode, setNodeStatus, type SpawnAssignment } from "./context-store.ts";
 import { allocateWorkspace, isWorkspaceKeyword, type Workspace } from "./workspace.ts";
-import { NOOP_TRACER, SPAN, type SpanLike, type Tracer } from "./trace.ts";
+import { NOOP_TRACER, SPAN, type SpanLike, spanName, type Tracer } from "./trace.ts";
+import { buildInstruments, type Instruments, type Meter } from "./metrics.ts";
 
 /** Attach GenAI-convention usage attributes to a span (best-effort). */
 function setUsageAttributes(span: SpanLike, u: UsageStats | undefined): void {
@@ -122,6 +123,14 @@ export interface RuntimeDeps {
 	tracer?: Tracer;
 	/** Internal: the parent span for spans started below this level (run → phase → subagent). */
 	_parentSpan?: SpanLike;
+	/**
+	 * Optional vendor-neutral metrics meter. Defaults to a no-op. Pass an
+	 * OpenTelemetry adapter (see `extensions/otel/metrics-adapter.ts`) to emit
+	 * run/phase/subagent duration, cost, token, and retry metrics.
+	 */
+	meter?: Meter;
+	/** Internal: instruments built once per run from `meter`, threaded to phases. */
+	_instruments?: Instruments;
 }
 
 export interface RuntimeResult {
@@ -733,18 +742,26 @@ async function executePhaseInner(
 	// One span per subagent spawn (each fan-out item, loop iteration, tournament
 	// candidate, and retry attempt is a distinct call to baseRun → distinct span),
 	// parented to the phase span threaded in via `_parentSpan`.
-	const baseRun = async (agentName: string, task: string, onLive?: (l: LiveUpdate) => void, ctxNodeId?: string): Promise<RunResult> => {
-		const span = tracer.startSpan(SPAN.subagent, {
+	const instruments = deps._instruments ?? buildInstruments(deps.meter);
+	const baseRun = async (agentName: string, task: string, onLive?: (l: LiveUpdate) => void, ctxNodeId?: string, attempt = 0): Promise<RunResult> => {
+		const span = tracer.startSpan(spanName.subagent(agentName), {
 			parent: deps._parentSpan,
+			kind: "client",
 			attributes: {
+				"taskflow.span_kind": SPAN.subagent,
+				"gen_ai.operation.name": "invoke_agent",
+				"gen_ai.agent.name": agentName,
 				"agent.name": agentName,
 				"agent.provider": phase.provider ?? "pi",
+				"gen_ai.system": phase.provider ?? "pi",
 				"phase.id": phase.id,
+				"subagent.attempt": attempt + 1,
 				"gen_ai.request.model": phase.model,
 				"taskflow.run_id": state.runId,
 				"taskflow.name": state.flowName,
 			},
 		});
+		const subStart = Date.now();
 		try {
 			const r = await run(
 				effCwd,
@@ -782,10 +799,19 @@ async function executePhaseInner(
 			const failed = isFailed(r);
 			span.setStatus({ ok: !failed, message: failed ? r.errorMessage || r.stderr : undefined });
 			span.end();
+			// Subagent metrics: per-invocation duration + token throughput, dimensioned
+			// by agent + model + outcome so you can compare agents/models head-to-head.
+			const subDims = { "taskflow.name": state.flowName, "agent.name": agentName, "gen_ai.request.model": phase.model ?? "default", "subagent.failed": failed };
+			instruments.subagentDuration.record(Date.now() - subStart, subDims);
+			if (r.usage) {
+				instruments.subagentTokens.add(r.usage.input, { ...subDims, "gen_ai.token.type": "input" });
+				instruments.subagentTokens.add(r.usage.output, { ...subDims, "gen_ai.token.type": "output" });
+			}
 			return r;
 		} catch (e) {
 			span.setStatus({ ok: false, message: e instanceof Error ? e.message : String(e) });
 			span.end();
+			instruments.subagentDuration.record(Date.now() - subStart, { "taskflow.name": state.flowName, "agent.name": agentName, "gen_ai.request.model": phase.model ?? "default", "subagent.failed": true });
 			throw e;
 		}
 	};
@@ -810,7 +836,7 @@ async function executePhaseInner(
 		let last: RunResult | undefined;
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
 			if (deps.signal?.aborted) break;
-			last = await baseRun(agentName, task, onLive, ctxNodeId);
+			last = await baseRun(agentName, task, onLive, ctxNodeId, attempt);
 			usages.push(last.usage);
 			// B6: aggregate and surface cumulative usage before the retry decision,
 			// so the TUI / budget guard see the in-flight spend on every attempt.
@@ -845,6 +871,17 @@ async function executePhaseInner(
 			// backoff.
 			const factor = retry ? (retry.factor ?? 1) : DEFAULT_TRANSIENT_FACTOR;
 			const wait = Math.min(60000, Math.round(baseMs * factor ** attempt));
+			// Make the retry visible on the phase timeline as a point-in-time event
+			// (instead of collapsing N attempts into one opaque attempt count) and
+			// bump a counter dimensioned by reason so flaky agents/models stand out.
+			const reason = transient ? "transient" : "policy";
+			deps._parentSpan?.addEvent?.("retry", {
+				"retry.attempt": attempt + 1,
+				"retry.reason": reason,
+				"retry.backoff_ms": wait,
+				"retry.error": last.errorMessage || last.stderr || undefined,
+			});
+			instruments.subagentRetries.add(1, { "taskflow.name": state.flowName, "agent.name": agentName, "retry.reason": reason });
 			if (wait > 0) await delay(wait, deps.signal);
 		}
 		// Aborted before any attempt ran → return a clean aborted result (no crash).
@@ -1429,6 +1466,10 @@ async function executePhaseInner(
 				break;
 			}
 			iterations = i;
+			// Mark each loop iteration on the phase timeline so a long-running loop
+			// shows its cadence (and where it eventually stopped) as discrete events,
+			// not a single fat bar whose only signal is a final iteration count.
+			deps._parentSpan?.addEvent?.("loop.iteration", { "loop.iteration": i, "loop.max": maxIters });
 			// The body sees its iteration number and the prior iteration's output.
 			const bodyCtx = buildInterpolationContext(state, previousOutput, {
 				loop: { iteration: i, lastOutput, maxIterations: maxIters },
@@ -1885,10 +1926,12 @@ export async function executeTaskflow(state: RunState, deps: RuntimeDeps): Promi
 	// Root span for the whole run. Sub-flows pass their parent phase span via
 	// `_parentSpan`, so nested flows nest in the trace instead of orphaning.
 	const tracer = deps.tracer ?? NOOP_TRACER;
-	const runSpan = tracer.startSpan(SPAN.run, {
+	const runSpan = tracer.startSpan(spanName.run(state.flowName), {
 		startTime: state.createdAt,
 		parent: deps._parentSpan,
+		kind: "internal",
 		attributes: {
+			"taskflow.span_kind": SPAN.run,
 			"taskflow.name": state.flowName,
 			"taskflow.run_id": state.runId,
 			"taskflow.phase_count": def.phases.length,
@@ -1900,8 +1943,13 @@ export async function executeTaskflow(state: RunState, deps: RuntimeDeps): Promi
 			"taskflow.resumed": Object.keys(state.phases ?? {}).length > 0,
 		},
 	});
-	// Child spans below the root parent to the run span.
-	const tracedDeps: RuntimeDeps = { ...deps, _parentSpan: runSpan };
+	// Instruments are built once per run from the meter (sub-flows reuse the
+	// parent's bundle so nested flows don't rebuild instruments). The no-op meter
+	// yields inert instruments, keeping the zero-cost-when-disabled promise.
+	const instruments = deps._instruments ?? buildInstruments(deps.meter);
+	const runStart = Date.now();
+	// Child spans below the root parent to the run span; instruments thread down too.
+	const tracedDeps: RuntimeDeps = { ...deps, _parentSpan: runSpan, _instruments: instruments };
 	try {
 		const result = await runTaskflowLayers(state, tracedDeps);
 		const counts = { done: 0, failed: 0, skipped: 0 };
@@ -1920,6 +1968,12 @@ export async function executeTaskflow(state: RunState, deps: RuntimeDeps): Promi
 		setUsageAttributes(runSpan, result.totalUsage);
 		runSpan.setStatus({ ok: result.ok });
 		runSpan.end();
+		// Run-level metrics: duration, cost, and an outcome counter, dimensioned by
+		// flow name + status so dashboards can trend per flow and alert on failures.
+		const runDims = { "taskflow.name": state.flowName, "taskflow.status": result.state.status, "taskflow.flow_version": def.version ?? 1 };
+		instruments.runDuration.record(Date.now() - runStart, runDims);
+		instruments.runCost.record(result.totalUsage.cost, runDims);
+		instruments.runs.add(1, runDims);
 		return result;
 	} catch (e) {
 		// A thrown phase must not leave the run wedged in "running" (which breaks
@@ -1938,6 +1992,10 @@ export async function executeTaskflow(state: RunState, deps: RuntimeDeps): Promi
 		runSpan.setStatus({ ok: false, message });
 		runSpan.setAttributes({ "taskflow.status": "failed" });
 		runSpan.end();
+		const failDims = { "taskflow.name": state.flowName, "taskflow.status": "failed", "taskflow.flow_version": def.version ?? 1 };
+		instruments.runDuration.record(Date.now() - runStart, failDims);
+		instruments.runCost.record(totalUsage.cost, failDims);
+		instruments.runs.add(1, failDims);
 		return { state, finalOutput: `Taskflow '${def.name}' crashed: ${message}`, ok: false, totalUsage };
 	}
 }
@@ -2019,10 +2077,12 @@ async function runTaskflowLayers(state: RunState, deps: RuntimeDeps): Promise<Ru
 				// didn't run (unmet dep, gate-blocked, budget, failed `when`) is the
 				// single most useful thing when debugging a flow that "did nothing".
 				const skipTracer = deps.tracer ?? NOOP_TRACER;
-				const skipSpan = skipTracer.startSpan(SPAN.phase, {
+				const skipSpan = skipTracer.startSpan(spanName.phase(phase.type ?? "agent", phase.id), {
 					startTime: skippedAt,
 					parent: deps._parentSpan,
+					kind: "internal",
 					attributes: {
+						"taskflow.span_kind": SPAN.phase,
 						"phase.id": phase.id,
 						"phase.type": phase.type ?? "agent",
 						"taskflow.run_id": state.runId,
@@ -2033,6 +2093,13 @@ async function runTaskflowLayers(state: RunState, deps: RuntimeDeps): Promise<Ru
 				skipSpan.setAttributes({ "phase.status": "skipped", "phase.skip_reason": skipReason });
 				skipSpan.setStatus({ ok: true });
 				skipSpan.end(skippedAt);
+				// Skipped phases count too — a flow that silently skips everything should
+				// be visible as a spike in skipped-phase volume, not an absence of data.
+				(deps._instruments ?? buildInstruments(deps.meter)).phases.add(1, {
+					"taskflow.name": state.flowName,
+					"phase.type": phase.type ?? "agent",
+					"phase.status": "skipped",
+				});
 				safeEmit(deps, state);
 				return;
 			}
@@ -2057,10 +2124,12 @@ async function runTaskflowLayers(state: RunState, deps: RuntimeDeps): Promise<Ru
 			// Per-phase span, parented to the run span. Subagent spawns below parent
 			// to THIS span (threaded via `_parentSpan`).
 			const tracer = deps.tracer ?? NOOP_TRACER;
-			const phaseSpan = tracer.startSpan(SPAN.phase, {
+			const phaseSpan = tracer.startSpan(spanName.phase(phase.type ?? "agent", phase.id), {
 				startTime: startedAt,
 				parent: deps._parentSpan,
+				kind: "internal",
 				attributes: {
+					"taskflow.span_kind": SPAN.phase,
 					"phase.id": phase.id,
 					"phase.type": phase.type ?? "agent",
 					"taskflow.run_id": state.runId,
@@ -2076,6 +2145,15 @@ async function runTaskflowLayers(state: RunState, deps: RuntimeDeps): Promise<Ru
 			if (ps.status === "failed") phaseSpan.setStatus({ ok: false, message: ps.error });
 			else phaseSpan.setStatus({ ok: true });
 			phaseSpan.end(ps.endedAt);
+			// Phase metrics: duration, cost, outcome counter, and cache hit/miss —
+			// dimensioned by type + status so you can see which phase types dominate
+			// time/spend and how often the cache saves a run.
+			const instruments = deps._instruments ?? buildInstruments(deps.meter);
+			const phaseDims = { "taskflow.name": state.flowName, "phase.type": phase.type ?? "agent", "phase.status": ps.status };
+			instruments.phaseDuration.record(Math.max(0, (ps.endedAt ?? Date.now()) - startedAt), phaseDims);
+			instruments.phaseCost.record(ps.usage?.cost ?? 0, phaseDims);
+			instruments.phases.add(1, phaseDims);
+			instruments.cacheHits.add(1, { "taskflow.name": state.flowName, "phase.type": phase.type ?? "agent", "cache.hit": ps.cacheHit ?? false });
 			// Preserve the phase start time: executePhase returns a fresh PhaseState
 			// that omits startedAt (cached/resumed results carry their own).
 			state.phases[phase.id] = ps.startedAt ? ps : { ...ps, startedAt };

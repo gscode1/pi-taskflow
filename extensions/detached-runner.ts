@@ -75,6 +75,7 @@ try {
 			// (safety: approval gates are never bypassed; the run records the rejection).
 			loadFlow: (name: string) => getFlow(ctx.cwd, name)?.def,
 			tracer: tracing?.tracer,
+			meter: tracing?.meter,
 		});
 
 		saveRun(result.state, cleanupConfig);

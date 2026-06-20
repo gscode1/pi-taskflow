@@ -34,7 +34,7 @@ interface OtelContext {
 	readonly __brand?: "context";
 }
 interface OtelTracer {
-	startSpan(name: string, opts?: { startTime?: number | Date; attributes?: Record<string, SpanAttributeValue> }, ctx?: OtelContext): OtelSpan;
+	startSpan(name: string, opts?: { startTime?: number | Date; kind?: number; attributes?: Record<string, SpanAttributeValue> }, ctx?: OtelContext): OtelSpan;
 }
 interface OtelApi {
 	trace: {
@@ -43,6 +43,7 @@ interface OtelApi {
 	};
 	context: { active(): OtelContext };
 	SpanStatusCode: { OK: number; ERROR: number };
+	SpanKind: { INTERNAL: number; CLIENT: number };
 }
 
 function loadOtel(): OtelApi {
@@ -96,9 +97,10 @@ export function otelTracer(otelTracerInstance?: OtelTracer): Tracer {
 			// context) keeps spans correct under the runtime's manual concurrency.
 			const parentRaw = (opts?.parent as WrappedSpan | undefined)?.[RAW];
 			const ctx = parentRaw ? api.trace.setSpan(api.context.active(), parentRaw) : api.context.active();
+			const kind = opts?.kind === "client" ? api.SpanKind.CLIENT : api.SpanKind.INTERNAL;
 			const span = tracer.startSpan(
 				name,
-				{ startTime: opts?.startTime, attributes: opts?.attributes ? dropUndefined(opts.attributes) : undefined },
+				{ startTime: opts?.startTime, kind, attributes: opts?.attributes ? dropUndefined(opts.attributes) : undefined },
 				ctx,
 			);
 			const wrapped = wrapSpan(api, span) as WrappedSpan;
