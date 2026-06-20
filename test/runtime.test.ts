@@ -390,6 +390,32 @@ test("runtime: gate PASS lets the flow continue", async () => {
 	assert.equal(res.state.phases.ship.status, "done");
 });
 
+test("runtime: agy gates do not get stdout idle watchdog", async () => {
+	const def: Taskflow = {
+		name: "agy-gate",
+		phases: [
+			{ id: "check", type: "gate", provider: "agy", agent: "a", task: "review" },
+		],
+	};
+	let opts: RunOptions | undefined;
+	const runTask: RuntimeDeps["runTask"] = async (_cwd, _agents, agentName, task, o): Promise<RunResult> => {
+		opts = o;
+		return {
+			agent: agentName,
+			task,
+			exitCode: 0,
+			output: "VERDICT: PASS",
+			stderr: "",
+			usage: { ...emptyUsage(), output: 1, cost: 0, turns: 1 },
+			stopReason: "end",
+		};
+	};
+	const res = await executeTaskflow(mkState(def), baseDeps(runTask));
+	assert.equal(res.ok, true);
+	assert.equal(opts?.provider, "agy");
+	assert.equal(opts?.idleTimeoutMs, 0);
+});
+
 test("runtime: gate wall-clock timeout under explicit retry policy stops after one attempt", async () => {
 	// Regression for run mqkzp8pk: a gate with retry:{max:2} that wall-clock
 	// timed out re-ran the same ~600s stall 3× ($0.38, no verdict). A deterministic

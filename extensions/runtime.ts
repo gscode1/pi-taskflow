@@ -757,7 +757,7 @@ async function executePhaseInner(
 					thinking: phase.thinking,
 					tools: phase.tools,
 					timeoutMs: phase.timeoutMs ?? gateDefaults.timeoutMs,
-					idleTimeoutMs: gateDefaults.idleTimeoutMs,
+					idleTimeoutMs: phase.provider === "agy" ? 0 : gateDefaults.idleTimeoutMs,
 					cwd: effCwd,
 					signal: deps.signal,
 					onLive,
