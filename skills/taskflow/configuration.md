@@ -91,6 +91,7 @@ Keys of each object in `phases[]`. Some only apply to specific `type`s.
 | `contextLimit` | all | `8000` | Max characters read **per file** in `context`. See §2.1. |
 | `cache` | all | `run-only` | Per-phase cache policy (`scope`/`ttl`/`fingerprint`). See §11. |
 | `final` | all | last phase | Exactly one phase may be `final`; its output is returned. |
+| `always` | all | `false` | Teardown/"finally": run this phase even after a gate **BLOCK** or a budget halt, so cleanup (worktree removal, claim release, temp teardown) is never silently skipped. Does **not** change the run's terminal status — a blocked run stays blocked. Dependency satisfaction still applies, so pair with `join: "any"` if upstream deps may be skipped. |
 
 > Gate-only control fields (`eval`, `onBlock`) and the loop/tournament control
 > fields (`until`/`maxIterations`/`convergence`, `variants`/`judge`/`judgeAgent`/`mode`)

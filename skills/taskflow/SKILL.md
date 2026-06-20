@@ -112,6 +112,7 @@ Call the `taskflow` tool. To run a brand-new flow you write inline, pass
 |-------|---------|
 | `when` | conditional guard — skip the phase unless the expression is truthy. Supports `{refs}`, `== != < > <= >=`, `&& \|\| !`, parentheses, quoted strings/numbers. Parse errors fail **open** (phase runs). |
 | `join` | dependency join: `"all"` (default — wait for every dep) or `"any"` (OR-join — run as soon as one dep completes). |
+| `always` | teardown/"finally" — run the phase even after a gate **BLOCK** or budget halt, so cleanup (worktree removal, claim release, temp dirs) is never silently skipped. The run still reports blocked. Pair with `join: "any"` so it runs when upstream deps were skipped. |
 | `retry` | `{ "max": N, "backoffMs": ms, "factor": k }` — retry a failing subagent up to N times; delay is `backoffMs * factor^attempt` (`factor:1`=fixed, `2`=exponential). |
 | `timeoutMs` | Wall-clock cap per subagent attempt; defaults to `600000` (10 minutes). Set explicitly on tool-heavy phases. |
 

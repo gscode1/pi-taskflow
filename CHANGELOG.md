@@ -5,6 +5,16 @@ All notable changes to pi-taskflow are documented here. This project follows [Ke
 ## [Unreleased]
 
 ### Added (fork-only)
+- **`always: true` teardown phases (a "finally" for flows).** A phase marked
+  `always` runs even after a gate **BLOCK** or a budget halt, so cleanup steps
+  (git worktree removal, claim-label release, temp-dir teardown) are never
+  silently skipped. Previously a blocked gate set a global flag that skipped
+  *every* downstream phase before the dependency/`join` check, leaking `/tmp`
+  worktrees and leaving claim locks stuck. The run's terminal status is
+  unchanged (a blocked run stays `blocked`); only the skip of `always` phases is
+  lifted. Dependency satisfaction still applies — pair with `join: "any"` so the
+  teardown runs when an upstream dep was itself skipped. Distinct from `final`
+  (which only designates the result phase). See `extensions/runtime.ts`.
 - **OpenTelemetry traces for flows (opt-in, zero-dependency seam).** The runtime
   now emits a `taskflow.run` → `taskflow.phase` → `taskflow.subagent` span
   hierarchy through a vendor-neutral `Tracer` interface

@@ -214,6 +214,12 @@ const PhaseSchema = Type.Object(
 		tools: Type.Optional(Type.Array(Type.String(), { description: "Restrict tools for this phase's agent" })),
 		cwd: Type.Optional(Type.String({ description: "Working directory for this phase's subagent. A literal path, or a reserved keyword: 'temp' (ephemeral dir, removed after the phase), 'dedicated' (persistent dir under the run state, kept), or 'worktree' (a git worktree on a throwaway branch, removed after the phase)." })),
 		final: Type.Optional(Type.Boolean({ description: "Mark this phase's output as the workflow result" })),
+		always: Type.Optional(
+			Type.Boolean({
+				description:
+					"Run this phase as a teardown/'finally' step even after a gate BLOCK or a budget halt, so cleanup (worktree removal, claim release, temp teardown) is never silently skipped. Dependency satisfaction still applies — pair with join:'any' so it runs when an upstream dep was skipped. Does not change the run's terminal status (a blocked run stays blocked).",
+			}),
+		),
 		optional: Type.Optional(
 			Type.Boolean({ description: "If true, a failure does not abort the run", default: false }),
 		),

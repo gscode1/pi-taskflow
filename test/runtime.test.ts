@@ -373,6 +373,53 @@ test("runtime: gate BLOCK halts the flow and skips downstream", async () => {
 	assert.match(res.finalOutput, /Gate blocked/);
 });
 
+test("runtime: always:true teardown runs even after a gate BLOCK (finally semantics)", async () => {
+	// Regression for run audit-arch-to-issues-mqmdl794: a gate BLOCK skipped the
+	// final:true cleanup-worktree phase, leaking a /tmp git worktree. A final
+	// teardown must run as a "finally" so cleanup is never silently skipped — while
+	// the run still reports "blocked". It needs join:"any" so its dep check passes
+	// when an upstream dep (here `create`) was itself skipped by the block.
+	const record: string[] = [];
+	const def: Taskflow = {
+		name: "gated-teardown",
+		phases: [
+			{ id: "work", type: "agent", agent: "a", task: "do work" },
+			{ id: "check", type: "gate", agent: "a", task: "review {steps.work.output}", dependsOn: ["work"] },
+			{ id: "create", type: "agent", agent: "a", task: "create from {steps.check.output}", dependsOn: ["check"] },
+			{ id: "teardown", type: "agent", agent: "a", task: "cleanup", dependsOn: ["work", "create"], join: "any", always: true, final: true },
+		],
+	};
+	const deps = baseDeps(
+		mockRunner((t) => (t.startsWith("review") ? "found problems\nVERDICT: BLOCK" : `ok:${t}`), { record }),
+	);
+	const res = await executeTaskflow(mkState(def), deps);
+	assert.equal(res.state.status, "blocked", "run still reports blocked");
+	assert.equal(res.ok, false);
+	assert.equal(res.state.phases.create.status, "skipped", "non-final downstream is still skipped by the block");
+	assert.equal(res.state.phases.teardown.status, "done", "final teardown runs despite the block");
+	assert.ok(record.includes("cleanup"), "teardown task actually executed");
+	assert.match(res.finalOutput, /Gate blocked/, "blocked message wins over teardown output");
+});
+
+test("runtime: always:true teardown runs even after a budget halt", async () => {
+	const record: string[] = [];
+	const def: Taskflow = {
+		name: "budget-teardown",
+		phases: [
+			{ id: "work", type: "agent", agent: "a", task: "do work" },
+			{ id: "more", type: "agent", agent: "a", task: "more work", dependsOn: ["work"] },
+			{ id: "teardown", type: "agent", agent: "a", task: "cleanup", dependsOn: ["work", "more"], join: "any", always: true, final: true },
+		],
+		budget: { maxUSD: 0.000001 }, // first phase already blows the cap
+	};
+	const deps = baseDeps(mockRunner(() => "ok", { record }));
+	const res = await executeTaskflow(mkState(def), deps);
+	assert.equal(res.state.status, "blocked", "budget halt still reports blocked");
+	assert.equal(res.state.phases.teardown.status, "done", "final teardown runs despite budget halt");
+	assert.ok(record.includes("cleanup"), "teardown task actually executed");
+	assert.match(res.finalOutput, /Budget exceeded/, "budget message wins over teardown output");
+});
+
 test("runtime: gate PASS lets the flow continue", async () => {
 	const def: Taskflow = {
 		name: "gated-pass",

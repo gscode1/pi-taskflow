@@ -1984,9 +1984,20 @@ async function runTaskflowLayers(state: RunState, deps: RuntimeDeps): Promise<Ru
 			const depsSatisfied =
 				deps_.length === 0 ? true : join === "any" ? deps_.some(depOk) : deps_.every(depOk);
 
+			// `always: true` phases are teardown/"finally" steps: they still run after a
+			// gate BLOCK or a budget ceiling so a cleanup phase (worktree removal, claim
+			// release, temp teardown) is never silently skipped — the failure that leaked
+			// /tmp worktrees on a blocked audit. The block/budget flags stay set, so the
+			// run's terminal status is still "blocked"/budget-halted (see the status +
+			// finalOutput logic below); only the skip is lifted. Dependency satisfaction
+			// still applies, so such a phase must declare `join: "any"` to run when an
+			// upstream dep was skipped. NB: this is distinct from `final` (which only
+			// designates the result phase) — overloading `final` would wrongly run a
+			// flow's main last work phase after a block.
+			const isTeardown = phase.always === true;
 			let skipReason: string | undefined;
-			if (gateBlocked) skipReason = `Gate blocked${gateReason ? `: ${gateReason}` : ""}`;
-			else if (budgetBlocked) skipReason = `Budget exceeded${budgetReason ? `: ${budgetReason}` : ""}`;
+			if (gateBlocked && !isTeardown) skipReason = `Gate blocked${gateReason ? `: ${gateReason}` : ""}`;
+			else if (budgetBlocked && !isTeardown) skipReason = `Budget exceeded${budgetReason ? `: ${budgetReason}` : ""}`;
 			else if (!depsSatisfied)
 				skipReason = join === "any" ? "All dependencies failed or were skipped" : "Upstream dependency not satisfied";
 			else if (phase.when !== undefined) {
