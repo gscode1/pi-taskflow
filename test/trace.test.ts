@@ -210,6 +210,52 @@ test("trace: failed phase marks span status not-ok", async () => {
 	assert.equal(phase?.attributes["phase.status"], "failed");
 });
 
+test("trace: content capture is off by default (no task/output attributes)", async () => {
+	const def = { name: "trace-content-off", phases: [{ id: "a", type: "agent", task: "secret task" }] };
+	const state = mkState(def, "trace-content-off-1");
+	const { tracer, spans } = recordingTracer();
+	const prev = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+	delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+	try {
+		const deps: RuntimeDeps = { cwd: "/tmp", agents: [dummyAgent], tracer, runTask: async (_c, _a, _n, t) => mockRunResult(`result of ${t}`) };
+		await executeTaskflow(state, deps);
+	} finally {
+		if (prev === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+		else process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = prev;
+	}
+	const sub = spans.find((s) => s.attributes["taskflow.span_kind"] === SPAN.subagent);
+	const phase = spans.find((s) => s.attributes["taskflow.span_kind"] === SPAN.phase);
+	assert.equal(sub?.attributes["subagent.output"], undefined);
+	assert.equal(sub?.attributes["gen_ai.completion"], undefined);
+	assert.equal(phase?.attributes["phase.output"], undefined);
+});
+
+test("trace: content capture surfaces truncated task + result when enabled", async () => {
+	const def = { name: "trace-content-on", phases: [{ id: "a", type: "agent", task: "do the thing" }] };
+	const state = mkState(def, "trace-content-on-1");
+	const { tracer, spans } = recordingTracer();
+	const prev = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+	const prevMax = process.env.PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS;
+	process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = "true";
+	process.env.PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS = "10";
+	try {
+		const deps: RuntimeDeps = { cwd: "/tmp", agents: [dummyAgent], tracer, runTask: async (_c, _a, _n, t) => mockRunResult(`RESULT-${"x".repeat(50)}`) };
+		await executeTaskflow(state, deps);
+	} finally {
+		if (prev === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+		else process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = prev;
+		if (prevMax === undefined) delete process.env.PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS;
+		else process.env.PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS = prevMax;
+	}
+	const sub = spans.find((s) => s.attributes["taskflow.span_kind"] === SPAN.subagent);
+	assert.equal(sub?.attributes["gen_ai.prompt"], "do the thi… [truncated 2 chars]");
+	const out = String(sub?.attributes["subagent.output"]);
+	assert.ok(out.startsWith("RESULT-xxx"), "output present");
+	assert.ok(out.includes("[truncated"), "output truncated to cap");
+	const phase = spans.find((s) => s.attributes["taskflow.span_kind"] === SPAN.phase);
+	assert.ok(String(phase?.attributes["phase.output"]).includes("[truncated"), "phase output captured + truncated");
+});
+
 test("trace: default no-op tracer does not throw and emits no records", async () => {
 	const def = { name: "trace-noop", phases: [{ id: "a", type: "agent", task: "hi" }] };
 	const state = mkState(def, "trace-3");

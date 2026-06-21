@@ -26,6 +26,45 @@ import { allocateWorkspace, isWorkspaceKeyword, type Workspace } from "./workspa
 import { NOOP_TRACER, SPAN, type SpanLike, spanName, type Tracer } from "./trace.ts";
 import { buildInstruments, type Instruments, type Meter } from "./metrics.ts";
 
+/**
+ * Content capture for spans — OFF by default because task inputs/outputs can
+ * carry sensitive data. Opt in with the standard OTel GenAI env var
+ * `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`. The per-field cap
+ * is `PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS` (default 4000) so a runaway transcript
+ * can't bloat the trace or leak more than necessary.
+ */
+function captureContentEnabled(): boolean {
+	const v = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+	return v === "true" || v === "1";
+}
+function contentMaxChars(): number {
+	const n = Number(process.env.PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS);
+	return Number.isFinite(n) && n > 0 ? Math.floor(n) : 4000;
+}
+/** Trim to the configured cap, annotating how many chars were dropped. */
+function truncateForSpan(text: string | undefined, max = contentMaxChars()): string | undefined {
+	if (!text) return undefined;
+	const t = text.trim();
+	if (!t) return undefined;
+	return t.length <= max ? t : `${t.slice(0, max)}… [truncated ${t.length - max} chars]`;
+}
+
+/**
+ * Attach the subagent's task input + result text to its span, so a failing run
+ * can be diagnosed straight from the trace. No-op unless content capture is
+ * enabled. Output is always truncated; on failure we also surface stderr.
+ */
+function setContentAttributes(span: SpanLike, task: string, r: RunResult, failed: boolean): void {
+	if (!captureContentEnabled()) return;
+	const max = contentMaxChars();
+	span.setAttributes({
+		"gen_ai.prompt": truncateForSpan(task, max),
+		"gen_ai.completion": truncateForSpan(r.output, max),
+		"subagent.output": truncateForSpan(r.output, max),
+		"subagent.stderr": failed ? truncateForSpan(r.stderr, max) : undefined,
+	});
+}
+
 /** Attach GenAI-convention usage attributes to a span (best-effort). */
 function setUsageAttributes(span: SpanLike, u: UsageStats | undefined): void {
 	if (!u) return;
@@ -66,6 +105,15 @@ function setPhaseOutcomeAttributes(span: SpanLike, ps: PhaseState): void {
 		"phase.def_error": ps.defError,
 		"phase.output_chars": ps.output?.length ?? undefined,
 	});
+	// Result content (opt-in) — the merged phase output, and the error detail on
+	// failure. Surfaced at the phase row so a failing flow is diagnosable from the
+	// trace without drilling into individual subagent spans.
+	if (captureContentEnabled()) {
+		span.setAttributes({
+			"phase.output": truncateForSpan(ps.output),
+			"phase.error": ps.status === "failed" ? truncateForSpan(ps.error) : undefined,
+		});
+	}
 	if (ps.gate) span.setAttributes({ "gate.verdict": ps.gate.verdict, "gate.reason": ps.gate.reason });
 	if (ps.approval)
 		span.setAttributes({ "approval.decision": ps.approval.decision, "approval.auto": ps.approval.auto ?? false, "approval.note": ps.approval.note });
@@ -797,6 +845,7 @@ async function executePhaseInner(
 			});
 			setUsageAttributes(span, r.usage);
 			const failed = isFailed(r);
+			setContentAttributes(span, task, r, failed);
 			span.setStatus({ ok: !failed, message: failed ? r.errorMessage || r.stderr : undefined });
 			span.end();
 			// Subagent metrics: per-invocation duration + token throughput, dimensioned
