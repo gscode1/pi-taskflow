@@ -27,15 +27,17 @@ import { NOOP_TRACER, SPAN, type SpanLike, spanName, type Tracer } from "./trace
 import { buildInstruments, type Instruments, type Meter } from "./metrics.ts";
 
 /**
- * Content capture for spans — OFF by default because task inputs/outputs can
- * carry sensitive data. Opt in with the standard OTel GenAI env var
- * `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`. The per-field cap
- * is `PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS` (default 4000) so a runaway transcript
- * can't bloat the trace or leak more than necessary.
+ * Content capture for spans — ON by default so failing agents are diagnosable
+ * straight from the trace. Outputs are always truncated to the per-field cap
+ * `PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS` (default 4000), so a runaway transcript
+ * can't bloat the trace. Because task inputs/outputs can carry sensitive data,
+ * opt OUT with the standard OTel GenAI env var by setting it to a falsy value:
+ * `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false`.
  */
 function captureContentEnabled(): boolean {
 	const v = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
-	return v === "true" || v === "1";
+	if (v === undefined || v === "") return true; // default on
+	return !(v === "false" || v === "0");
 }
 function contentMaxChars(): number {
 	const n = Number(process.env.PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS);

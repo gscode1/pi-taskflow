@@ -210,12 +210,32 @@ test("trace: failed phase marks span status not-ok", async () => {
 	assert.equal(phase?.attributes["phase.status"], "failed");
 });
 
-test("trace: content capture is off by default (no task/output attributes)", async () => {
+test("trace: content capture is on by default (task/output attributes present)", async () => {
+	const def = { name: "trace-content-default", phases: [{ id: "a", type: "agent", task: "the task" }] };
+	const state = mkState(def, "trace-content-default-1");
+	const { tracer, spans } = recordingTracer();
+	const prev = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+	delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+	try {
+		const deps: RuntimeDeps = { cwd: "/tmp", agents: [dummyAgent], tracer, runTask: async (_c, _a, _n, t) => mockRunResult(`result of ${t}`) };
+		await executeTaskflow(state, deps);
+	} finally {
+		if (prev === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+		else process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = prev;
+	}
+	const sub = spans.find((s) => s.attributes["taskflow.span_kind"] === SPAN.subagent);
+	const phase = spans.find((s) => s.attributes["taskflow.span_kind"] === SPAN.phase);
+	assert.equal(sub?.attributes["gen_ai.prompt"], "the task");
+	assert.equal(sub?.attributes["subagent.output"], "result of the task");
+	assert.equal(phase?.attributes["phase.output"], "result of the task");
+});
+
+test("trace: content capture can be disabled with the opt-out env var", async () => {
 	const def = { name: "trace-content-off", phases: [{ id: "a", type: "agent", task: "secret task" }] };
 	const state = mkState(def, "trace-content-off-1");
 	const { tracer, spans } = recordingTracer();
 	const prev = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
-	delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+	process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = "false";
 	try {
 		const deps: RuntimeDeps = { cwd: "/tmp", agents: [dummyAgent], tracer, runTask: async (_c, _a, _n, t) => mockRunResult(`result of ${t}`) };
 		await executeTaskflow(state, deps);

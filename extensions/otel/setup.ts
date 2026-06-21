@@ -14,12 +14,13 @@
  *               @opentelemetry/resources @opentelemetry/semantic-conventions
  *   export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
  *
- * Content capture (task inputs + result text on spans) is OFF by default since
- * those can carry sensitive data. To aid troubleshooting, opt in with the
- * standard OTel GenAI flag — outputs are always truncated:
+ * Content capture (task inputs + result text on spans) is ON by default to aid
+ * troubleshooting; outputs are always truncated (default 4000 chars per field).
+ * Since those can carry sensitive data, opt OUT with the standard OTel GenAI
+ * flag, or tune the cap:
  *
- *   export OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true
- *   export PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS=4000   # optional per-field cap
+ *   export OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false  # disable
+ *   export PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS=4000                   # per-field cap
  *
  * Everything here is fail-open: if the env var is absent, packages are missing,
  * or setup throws, we return `undefined` and the run proceeds untraced. A flow
