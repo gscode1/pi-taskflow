@@ -268,12 +268,78 @@ test("trace: content capture surfaces truncated task + result when enabled", asy
 		else process.env.PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS = prevMax;
 	}
 	const sub = spans.find((s) => s.attributes["taskflow.span_kind"] === SPAN.subagent);
-	assert.equal(sub?.attributes["gen_ai.prompt"], "do the thi… [truncated 2 chars]");
+	// Head+tail truncation: max=10 → head=7, tail=3. "do the thing" (12) drops 2.
+	assert.equal(sub?.attributes["gen_ai.prompt"], "do the \n…[truncated 2 chars]…\ning");
 	const out = String(sub?.attributes["subagent.output"]);
-	assert.ok(out.startsWith("RESULT-xxx"), "output present");
+	assert.ok(out.startsWith("RESULT-"), "output head present");
 	assert.ok(out.includes("[truncated"), "output truncated to cap");
 	const phase = spans.find((s) => s.attributes["taskflow.span_kind"] === SPAN.phase);
 	assert.ok(String(phase?.attributes["phase.output"]).includes("[truncated"), "phase output captured + truncated");
+});
+
+test("trace: head+tail truncation keeps content appended to the end (retry feedback)", async () => {
+	const prev = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+	const prevMax = process.env.PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS;
+	process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = "true";
+	process.env.PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS = "100";
+	try {
+		// A large plan with a short, critical instruction appended at the very end —
+		// exactly the shape of a retried executor task. Head-only truncation would
+		// drop the tail; head+tail must preserve it.
+		const task = "PLAN: " + "x".repeat(500) + " FIX_THE_FAILING_TEST_NOW";
+		const { tracer, spans } = recordingTracer();
+		const state = mkState({ name: "trace-tail", phases: [{ id: "a", type: "agent", task }] }, "trace-tail-1");
+		await executeTaskflow(state, { cwd: "/tmp", agents: [dummyAgent], tracer, runTask: async () => mockRunResult("ok") });
+		const sub = spans.find((s) => s.attributes["taskflow.span_kind"] === SPAN.subagent);
+		const prompt = String(sub?.attributes["gen_ai.prompt"]);
+		assert.ok(prompt.startsWith("PLAN: xxx"), "head preserved");
+		assert.ok(prompt.includes("…[truncated"), "middle dropped with marker");
+		assert.ok(prompt.endsWith("FIX_THE_FAILING_TEST_NOW"), "tail (appended instruction) preserved");
+	} finally {
+		if (prev === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+		else process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = prev;
+		if (prevMax === undefined) delete process.env.PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS;
+		else process.env.PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS = prevMax;
+	}
+});
+
+test("trace: gate-block retry tags the re-run subagent with is_retry + retry_feedback", async () => {
+	// build (agent) → verify (gate, onBlock:retry). First verify blocks, forcing a
+	// re-run of `build` with the gate feedback injected; second verify passes.
+	const def = {
+		name: "trace-retry",
+		phases: [
+			{ id: "build", type: "agent", task: "do the build" },
+			{ id: "verify", type: "gate", dependsOn: ["build"], onBlock: "retry", retry: { max: 1 }, task: "check it" },
+		],
+	};
+	const state = mkState(def, "trace-retry-1");
+	const { tracer, spans } = recordingTracer();
+	const prev = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+	process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = "true";
+	let verifyCalls = 0;
+	const runTask: RuntimeDeps["runTask"] = async (_c, _a, agent, _t) => {
+		if (agent === "verifier" || _t === "check it") {
+			verifyCalls++;
+			const verdict = verifyCalls === 1 ? "tests failed at foo.test.ts\nVERDICT: BLOCK" : "VERDICT: PASS";
+			return { agent: "verifier", task: "", exitCode: 0, output: verdict, stderr: "", usage: emptyUsage(), model: "m" };
+		}
+		return mockRunResult("built");
+	};
+	try {
+		await executeTaskflow(state, { cwd: "/tmp", agents: [dummyAgent], tracer, runTask });
+	} finally {
+		if (prev === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+		else process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = prev;
+	}
+	const buildSubs = spans.filter((s) => s.attributes["taskflow.span_kind"] === SPAN.subagent && s.attributes["phase.id"] === "build");
+	assert.equal(buildSubs.length, 2, "build runs twice: initial + gate retry");
+	// First build run: not a retry, no feedback.
+	assert.equal(buildSubs[0].attributes["subagent.is_retry"], false);
+	assert.equal(buildSubs[0].attributes["subagent.retry_feedback"], undefined);
+	// Second build run: tagged as a retry, carrying the gate's block feedback.
+	assert.equal(buildSubs[1].attributes["subagent.is_retry"], true);
+	assert.ok(String(buildSubs[1].attributes["subagent.retry_feedback"]).includes("tests failed at foo.test.ts"), "gate feedback captured on the retried span");
 });
 
 test("trace: default no-op tracer does not throw and emits no records", async () => {

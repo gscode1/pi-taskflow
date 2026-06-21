@@ -15,9 +15,11 @@
  *   export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
  *
  * Content capture (task inputs + result text on spans) is ON by default to aid
- * troubleshooting; outputs are always truncated (default 4000 chars per field).
- * Since those can carry sensitive data, opt OUT with the standard OTel GenAI
- * flag, or tune the cap:
+ * troubleshooting; values are truncated head+tail (default 4000 chars/field) so
+ * content appended to a task — e.g. a gate's retry feedback — stays visible. A
+ * gate-block re-run is also tagged with `subagent.is_retry` +
+ * `subagent.retry_feedback`. Since content can be sensitive, opt OUT with the
+ * standard OTel GenAI flag, or tune the cap:
  *
  *   export OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false  # disable
  *   export PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS=4000                   # per-field cap

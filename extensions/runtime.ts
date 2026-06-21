@@ -43,20 +43,35 @@ function contentMaxChars(): number {
 	const n = Number(process.env.PI_TASKFLOW_OTEL_CONTENT_MAX_CHARS);
 	return Number.isFinite(n) && n > 0 ? Math.floor(n) : 4000;
 }
-/** Trim to the configured cap, annotating how many chars were dropped. */
+/**
+ * Trim to the configured cap, keeping BOTH ends. Head-only truncation silently
+ * drops whatever is appended to a prompt — and the runtime appends the most
+ * diagnostically valuable bit (gate retry feedback) to the END of a task. So we
+ * keep ~70% head + ~30% tail with a visible marker in the middle, guaranteeing
+ * appended content survives. Short values pass through untouched.
+ */
 function truncateForSpan(text: string | undefined, max = contentMaxChars()): string | undefined {
 	if (!text) return undefined;
 	const t = text.trim();
 	if (!t) return undefined;
-	return t.length <= max ? t : `${t.slice(0, max)}… [truncated ${t.length - max} chars]`;
+	if (t.length <= max) return t;
+	const dropped = t.length - max;
+	const head = Math.ceil(max * 0.7);
+	const tail = max - head;
+	return `${t.slice(0, head)}\n…[truncated ${dropped} chars]…\n${t.slice(t.length - tail)}`;
 }
 
 /**
  * Attach the subagent's task input + result text to its span, so a failing run
  * can be diagnosed straight from the trace. No-op unless content capture is
  * enabled. Output is always truncated; on failure we also surface stderr.
+ *
+ * `retryFeedback` is the gate-block feedback the runtime appends to a re-run
+ * task (see the onBlock:retry path). It's captured as its OWN attribute — not
+ * just buried in the (truncatable) task — so you can always see whether a retry
+ * was informed by the gate and exactly what it was told.
  */
-function setContentAttributes(span: SpanLike, task: string, r: RunResult, failed: boolean): void {
+function setContentAttributes(span: SpanLike, task: string, r: RunResult, failed: boolean, retryFeedback?: string): void {
 	if (!captureContentEnabled()) return;
 	const max = contentMaxChars();
 	span.setAttributes({
@@ -64,6 +79,7 @@ function setContentAttributes(span: SpanLike, task: string, r: RunResult, failed
 		"gen_ai.completion": truncateForSpan(r.output, max),
 		"subagent.output": truncateForSpan(r.output, max),
 		"subagent.stderr": failed ? truncateForSpan(r.stderr, max) : undefined,
+		"subagent.retry_feedback": truncateForSpan(retryFeedback, max),
 	});
 }
 
@@ -806,6 +822,10 @@ async function executePhaseInner(
 				"gen_ai.system": phase.provider ?? "pi",
 				"phase.id": phase.id,
 				"subagent.attempt": attempt + 1,
+				// True when this run is a gate-block retry (the runtime appended the
+				// gate's feedback to the task). Low-cardinality, always emitted, so
+				// you can find informed retries even when content capture is off.
+				"subagent.is_retry": deps._retryFeedback != null,
 				"gen_ai.request.model": phase.model,
 				"taskflow.run_id": state.runId,
 				"taskflow.name": state.flowName,
@@ -847,7 +867,7 @@ async function executePhaseInner(
 			});
 			setUsageAttributes(span, r.usage);
 			const failed = isFailed(r);
-			setContentAttributes(span, task, r, failed);
+			setContentAttributes(span, task, r, failed, deps._retryFeedback);
 			span.setStatus({ ok: !failed, message: failed ? r.errorMessage || r.stderr : undefined });
 			span.end();
 			// Subagent metrics: per-invocation duration + token throughput, dimensioned
